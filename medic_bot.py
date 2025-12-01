@@ -131,11 +131,11 @@ def update_leaderboard():
         rank_by_medic = {}
 
     # Create or open the monthly leaderboard sheet
-    try:
+try:
         leaderboard_sheet = ss.worksheet(sheet_title)
-    except gspread.exceptions.WorksheetNotFound:
+except gspread.exceptions.WorksheetNotFound:
     # Create the sheet (first-time only)
-        leaderboard_sheet = ss.add_worksheet(title=sheet_title, rows=200, cols=10)
+    leaderboard_sheet = ss.add_worksheet(title=sheet_title, rows=200, cols=10)
     leaderboard_sheet.update([[
         "Rank", "Medic", "Raw Points", "Jobs Logged",
         "Rank Title", "Bonus Multiplier",
@@ -240,11 +240,11 @@ def update_single_leaderboard(year: int, month: int):
         rank_by_medic = {}
 
     # Create or open the sheet
-    try:
+try:
         leaderboard_sheet = ss.worksheet(sheet_title)
-    except gspread.exceptions.WorksheetNotFound:
+except gspread.exceptions.WorksheetNotFound:
     # Create the sheet (first-time only)
-        leaderboard_sheet = ss.add_worksheet(title=sheet_title, rows=200, cols=10)
+    leaderboard_sheet = ss.add_worksheet(title=sheet_title, rows=200, cols=10)
     leaderboard_sheet.update([[
         "Rank", "Medic", "Raw Points", "Jobs Logged",
         "Rank Title", "Bonus Multiplier",
