@@ -215,6 +215,130 @@ def update_leaderboard():
     print(f"✅ Leaderboard updated for {current_month_name} {current_year}")
     return sorted_data, jobs_by_medic
 
+def update_single_leaderboard(year: int, month: int):
+    ss = GC.open_by_key(SPREADSHEET_ID)
+    records = SHEET.get_all_records()
+
+    sheet_title = f"Leaderboard - {datetime(year, month, 1).strftime('%b')} {year}"
+    BANK_RYO = 5000
+
+    # Load ranks
+    try:
+        master = ss.worksheet("Leaf Master Medical Log")
+        master_records = master.get_all_records()
+        rank_by_medic = {
+            row.get("Medic", ""): row.get("Rank", "Unranked")
+            for row in master_records
+        }
+    except gspread.exceptions.WorksheetNotFound:
+        rank_by_medic = {}
+
+    # Create or open the sheet
+    try:
+        leaderboard_sheet = ss.worksheet(sheet_title)
+    except gspread.exceptions.WorksheetNotFound:
+        leaderboard_sheet = ss.add_worksheet(sheet_title, rows=200, cols=10)
+    leaderboard_sheet.update([[
+        "Rank", "Medic", "Raw Points", "Jobs Logged",
+        "Rank Title", "Bonus Multiplier",
+        "Adjusted Points", "Total Pay", "Total Ryo"
+    ]])
+
+
+    # Collect raw data for this month
+    points_by_medic = defaultdict(int)
+    jobs_by_medic = defaultdict(int)
+
+    for row in records:
+        date_str = str(row.get("Report Date", "")).strip()
+        if not date_str:
+            continue
+
+        try:
+            d = datetime.strptime(date_str, "%m/%d/%Y")
+        except ValueError:
+            continue
+
+        if d.year == year and d.month == month:
+            medics = [m.strip() for m in row.get("Medics", "").split(",") if m.strip()]
+            pts = int(row.get("Points", 0))
+
+            for medic in medics:
+                points_by_medic[medic] += pts
+                jobs_by_medic[medic] += 1
+
+    # If empty month
+    if not points_by_medic:
+        leaderboard_sheet.update([["No data for this month."]])
+        return
+
+    adjusted = {}
+    for medic, raw_pts in points_by_medic.items():
+        rank = rank_by_medic.get(medic, "Unranked")
+        mult = bonus_from_rank(rank)
+        adjusted[medic] = raw_pts * mult
+
+    total_adj = sum(adjusted.values())
+
+    output = [[
+        "Rank", "Medic", "Raw Points", "Jobs Logged",
+        "Rank Title", "Bonus Multiplier",
+        "Adjusted Points", "Total Pay", "Total Ryo"
+    ]]
+
+    sorted_medics = sorted(adjusted.items(), key=lambda x: x[1], reverse=True)
+
+    for i, (medic, adj_pts) in enumerate(sorted_medics, start=1):
+        raw_pts = points_by_medic[medic]
+        jobs = jobs_by_medic[medic]
+        rank_title = rank_by_medic.get(medic, "Unranked")
+        mult = bonus_from_rank(rank_title)
+        share = adj_pts / total_adj if total_adj else 0
+        pay = round(share * BANK_RYO, 2)
+
+        output.append([
+            i, medic, raw_pts, jobs, rank_title, mult,
+            round(adj_pts, 2), pay,
+            BANK_RYO if i == 1 else ""
+        ])
+
+    leaderboard_sheet.clear()
+    leaderboard_sheet.update(output)
+
+    print(f"Updated leaderboard: {sheet_title}")
+
+
+def update_all_leaderboards():
+    """Rebuild leaderboard sheets for every month found in the raw log."""
+    ss = GC.open_by_key(SPREADSHEET_ID)
+    records = SHEET.get_all_records()
+
+    # Find all months with data
+    months = set()
+
+    for row in records:
+        date_str = str(row.get("Report Date", "")).strip()
+        if not date_str:
+            continue
+
+        try:
+            d = datetime.strptime(date_str, "%m/%d/%Y")
+            months.add((d.year, d.month))
+        except ValueError:
+            continue
+
+    # Sort oldest → newest
+    months = sorted(months)
+
+    # Rebuild the leaderboard for each month
+    for year, month in months:
+        month_name = datetime(year, month, 1).strftime("%b")
+        title = f"Leaderboard - {month_name} {year}"
+
+        # Temporarily override datetime.now() behavior
+        print(f"📅 Updating leaderboard for: {title}")
+        update_single_leaderboard(year, month)
+
 
 # ================= MASTER LOG (LIFETIME) =================
 def update_master_log():
@@ -334,6 +458,18 @@ bot = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(bot)
 
 
+# ================= Update ALL leaderboards =================
+@tree.command(name="updatelogs", description="Force update ALL leaderboard sheets and the master log.")
+@discord.app_commands.guilds(discord.Object(id=GUILD_ID))
+async def update_logs(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        update_master_log()
+        update_all_leaderboards()
+        await interaction.followup.send("✅ All logs and leaderboards updated!")
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error: {e}")
+
 # ---------- /leaderboard (monthly) ----------
 @tree.command(name="leaderboard", description="Show this month's medic leaderboard")
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
@@ -366,7 +502,6 @@ async def leaderboard_cmd(interaction: discord.Interaction):
 
     except Exception as e:
         await interaction.followup.send(f"⚠️ Error loading leaderboard: {e}")
-
 
 # ---------- /medicstats (lifetime) ----------
 @tree.command(name="medicstats", description="View lifetime stats for a specific medic")
