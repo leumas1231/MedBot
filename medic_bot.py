@@ -144,7 +144,7 @@ def update_leaderboard():
         ]])
 
                 # Default I2 value
-        leaderboard_sheet.update("I2", "5000")
+    leaderboard_sheet.update("I2", [[5000]])
 
     # Load BANK_RYO from cell I2
     try:
@@ -228,7 +228,6 @@ def update_single_leaderboard(year: int, month: int):
     records = SHEET.get_all_records()
 
     sheet_title = f"Leaderboard - {datetime(year, month, 1).strftime('%b')} {year}"
-    BANK_RYO = 5000
 
     # Load ranks
     try:
@@ -251,7 +250,7 @@ def update_single_leaderboard(year: int, month: int):
         "Rank Title", "Bonus Multiplier",
         "Adjusted Points", "Total Pay", "Total Ryo"
     ]])
-    leaderboard_sheet.update("I2", "5000")
+    leaderboard_sheet.update("I2", [[5000]])
 
     # Load BANK_RYO from sheet cell I2
     try:
