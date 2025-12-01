@@ -131,19 +131,18 @@ def update_leaderboard():
         rank_by_medic = {}
 
     # Create or open the monthly leaderboard sheet
+t# Create or open the monthly leaderboard sheet
 try:
-        leaderboard_sheet = ss.worksheet(sheet_title)
+    leaderboard_sheet = ss.worksheet(sheet_title)
 except gspread.exceptions.WorksheetNotFound:
-    # Create the sheet (first-time only)
     leaderboard_sheet = ss.add_worksheet(title=sheet_title, rows=200, cols=10)
     leaderboard_sheet.update([[
         "Rank", "Medic", "Raw Points", "Jobs Logged",
         "Rank Title", "Bonus Multiplier",
         "Adjusted Points", "Total Pay", "Total Ryo"
     ]])
+    leaderboard_sheet.update("I2", [[5000]])  # ONLY set default for new sheets
 
-    # Only set a default value IF the sheet is brand new
-    leaderboard_sheet.update("I2", [[5000]])
 
     # Load BANK_RYO from cell I2
     try:
@@ -240,19 +239,18 @@ def update_single_leaderboard(year: int, month: int):
         rank_by_medic = {}
 
     # Create or open the sheet
+# Create or open the monthly leaderboard sheet
 try:
-        leaderboard_sheet = ss.worksheet(sheet_title)
+    leaderboard_sheet = ss.worksheet(sheet_title)
 except gspread.exceptions.WorksheetNotFound:
-    # Create the sheet (first-time only)
     leaderboard_sheet = ss.add_worksheet(title=sheet_title, rows=200, cols=10)
     leaderboard_sheet.update([[
         "Rank", "Medic", "Raw Points", "Jobs Logged",
         "Rank Title", "Bonus Multiplier",
         "Adjusted Points", "Total Pay", "Total Ryo"
     ]])
+    leaderboard_sheet.update("I2", [[5000]])  # ONLY set default for new sheets
 
-    # Only set a default value IF the sheet is brand new
-    leaderboard_sheet.update("I2", [[5000]])
 
     # Load BANK_RYO from sheet cell I2
     try:
