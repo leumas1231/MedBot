@@ -2,22 +2,23 @@ import discord
 import re
 import gspread
 import os
+import json
 from dotenv import load_dotenv
+load_dotenv()
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from collections import defaultdict
 
-load_dotenv()
-
 # ================= CONFIG =================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = 1439473833273856120  # text channel if needed
+CHANNEL_ID = 1439473833273856120                   # text channel if needed
 SPREADSHEET_ID = "1aXhvKbXqXlHEu94dQctSJP8jk6tLvNWkrYHZyDYcI0c"
-GUILD_ID = 861362652710174740     # your real server (guild) ID
+GUILD_ID = 861362652710174740                   # your real server (guild) ID
 
 # Google Sheets auth
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# Instead of GOOGLE_CREDENTIALS
 CREDS = Credentials.from_service_account_file(
     os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
     scopes=SCOPES
@@ -104,43 +105,7 @@ def bonus_from_rank(rank: str) -> float:
     return 1.0  # Unranked / unknown
 
 
-# ================= HELPER: ENSURE LEADERBOARD SHEET =================
-def get_or_create_leaderboard_sheet(ss, sheet_title):
-    """
-    Returns the leaderboard worksheet.
-    If it doesn't exist, creates it with:
-    - Row 1: header row
-    - Row 2: free for config (I2 = Bank Ryo, set manually by you)
-    """
-    try:
-        leaderboard_sheet = ss.worksheet(sheet_title)
-    except gspread.exceptions.WorksheetNotFound:
-        leaderboard_sheet = ss.add_worksheet(title=sheet_title, rows=200, cols=10)
-        header_row = [
-            "Rank", "Medic", "Raw Points", "Jobs Logged",
-            "Rank Title", "Bonus Multiplier",
-            "Adjusted Points", "Total Pay", "Total Ryo"
-        ]
-        # Write header to row 1
-        leaderboard_sheet.update('A1:I1', [header_row])
-        # Row 2 is intentionally left alone so you can put Bank Ryo in I2 manually.
-    return leaderboard_sheet
-
-
-def get_bank_ryo(leaderboard_sheet):
-    """
-    Reads Bank Ryo from cell I2.
-    Does NOT write anything.
-    If it's missing/invalid, falls back to 5000 in code only (doesn't touch sheet).
-    """
-    try:
-        value = leaderboard_sheet.acell("I2").value
-        return float(value)
-    except Exception:
-        return 5000.0
-
-
-# ================= MONTHLY LEADERBOARD (CURRENT MONTH) =================
+# ================= MONTHLY LEADERBOARD =================
 def update_leaderboard():
     records = SHEET.get_all_records()
     now = datetime.now()
@@ -149,6 +114,8 @@ def update_leaderboard():
     current_month_name = now.strftime("%b")
 
     sheet_title = f"Leaderboard - {current_month_name} {current_year}"
+    BANK_RYO = 15000
+
     ss = GC.open_by_key(SPREADSHEET_ID)
 
     # Load ranks from Master Log (if exists)
@@ -161,10 +128,21 @@ def update_leaderboard():
             if medic_name:
                 rank_by_medic[medic_name] = row.get("Rank", "Unranked")
     except gspread.exceptions.WorksheetNotFound:
+        # No master sheet yet; everyone effectively Unranked
         rank_by_medic = {}
 
-    leaderboard_sheet = get_or_create_leaderboard_sheet(ss, sheet_title)
-    BANK_RYO = get_bank_ryo(leaderboard_sheet)
+    # Create or open the monthly leaderboard sheet
+    try:
+        leaderboard_sheet = ss.worksheet(sheet_title)
+    except gspread.exceptions.WorksheetNotFound:
+        leaderboard_sheet = ss.add_worksheet(
+            title=sheet_title, rows="200", cols="10"
+        )
+        leaderboard_sheet.update([[
+            "Rank", "Medic", "Raw Points", "Jobs Logged",
+            "Rank Title", "Bonus Multiplier",
+            "Adjusted Points", "Total Pay", "Total Ryo"
+        ]])
 
     points_by_medic = defaultdict(int)
     jobs_by_medic = defaultdict(int)
@@ -190,19 +168,12 @@ def update_leaderboard():
                 points_by_medic[medic] += points
                 jobs_by_medic[medic] += 1
 
-    # Clear old data rows but keep header (row 1) and config row (row 2)
-    try:
-        leaderboard_sheet.batch_clear(['A3:I1000'])
-    except Exception:
-        # If batch_clear not available, it's fine – new data will overwrite top rows.
-        pass
-
     if not points_by_medic:
-        # No data for this month: write a simple message at A3
-        leaderboard_sheet.update('A3', [["No data for this month."]])
+        leaderboard_sheet.clear()
+        leaderboard_sheet.update([["No data for this month."]])
         return [], {}
 
-    # Adjust with rank bonuses
+    # Adjust with rank bonuses (from Master Log Rank)
     adjusted_points = {}
     for medic, raw in points_by_medic.items():
         rank = rank_by_medic.get(medic, "Unranked")
@@ -212,7 +183,12 @@ def update_leaderboard():
     total_adjusted = sum(adjusted_points.values())
     sorted_data = sorted(adjusted_points.items(), key=lambda x: x[1], reverse=True)
 
-    data_rows = []
+    output = [[
+        "Rank", "Medic", "Raw Points", "Jobs Logged",
+        "Rank Title", "Bonus Multiplier",
+        "Adjusted Points", "Total Pay", "Total Ryo"
+    ]]
+
     for i, (medic, adj) in enumerate(sorted_data, start=1):
         raw = points_by_medic[medic]
         jobs = jobs_by_medic[medic]
@@ -221,7 +197,7 @@ def update_leaderboard():
         share = adj / total_adjusted if total_adjusted > 0 else 0
         pay = round(share * BANK_RYO, 2)
 
-        data_rows.append([
+        output.append([
             i,
             medic,
             raw,
@@ -233,19 +209,18 @@ def update_leaderboard():
             BANK_RYO if i == 1 else ""
         ])
 
-    # Write data starting at row 3
-    leaderboard_sheet.update('A3', data_rows)
+    leaderboard_sheet.clear()
+    leaderboard_sheet.update(output)
 
     print(f"✅ Leaderboard updated for {current_month_name} {current_year}")
     return sorted_data, jobs_by_medic
 
-
-# ================= SINGLE MONTH LEADERBOARD (YEAR, MONTH) =================
 def update_single_leaderboard(year: int, month: int):
     ss = GC.open_by_key(SPREADSHEET_ID)
     records = SHEET.get_all_records()
 
     sheet_title = f"Leaderboard - {datetime(year, month, 1).strftime('%b')} {year}"
+    BANK_RYO = 15000
 
     # Load ranks
     try:
@@ -258,9 +233,19 @@ def update_single_leaderboard(year: int, month: int):
     except gspread.exceptions.WorksheetNotFound:
         rank_by_medic = {}
 
-    leaderboard_sheet = get_or_create_leaderboard_sheet(ss, sheet_title)
-    BANK_RYO = get_bank_ryo(leaderboard_sheet)
+    # Create or open the sheet
+    try:
+        leaderboard_sheet = ss.worksheet(sheet_title)
+    except gspread.exceptions.WorksheetNotFound:
+        leaderboard_sheet = ss.add_worksheet(sheet_title, rows=200, cols=10)
+    leaderboard_sheet.update([[
+        "Rank", "Medic", "Raw Points", "Jobs Logged",
+        "Rank Title", "Bonus Multiplier",
+        "Adjusted Points", "Total Pay", "Total Ryo"
+    ]])
 
+
+    # Collect raw data for this month
     points_by_medic = defaultdict(int)
     jobs_by_medic = defaultdict(int)
 
@@ -276,24 +261,15 @@ def update_single_leaderboard(year: int, month: int):
 
         if d.year == year and d.month == month:
             medics = [m.strip() for m in row.get("Medics", "").split(",") if m.strip()]
-            try:
-                pts = int(row.get("Points", 0))
-            except ValueError:
-                pts = 0
+            pts = int(row.get("Points", 0))
 
             for medic in medics:
                 points_by_medic[medic] += pts
                 jobs_by_medic[medic] += 1
 
-    # Clear old data rows but keep header + config row
-    try:
-        leaderboard_sheet.batch_clear(['A3:I1000'])
-    except Exception:
-        pass
-
+    # If empty month
     if not points_by_medic:
-        leaderboard_sheet.update('A3', [["No data for this month."]])
-        print(f"Updated leaderboard (no data): {sheet_title}")
+        leaderboard_sheet.update([["No data for this month."]])
         return
 
     adjusted = {}
@@ -304,7 +280,12 @@ def update_single_leaderboard(year: int, month: int):
 
     total_adj = sum(adjusted.values())
 
-    data_rows = []
+    output = [[
+        "Rank", "Medic", "Raw Points", "Jobs Logged",
+        "Rank Title", "Bonus Multiplier",
+        "Adjusted Points", "Total Pay", "Total Ryo"
+    ]]
+
     sorted_medics = sorted(adjusted.items(), key=lambda x: x[1], reverse=True)
 
     for i, (medic, adj_pts) in enumerate(sorted_medics, start=1):
@@ -315,13 +296,15 @@ def update_single_leaderboard(year: int, month: int):
         share = adj_pts / total_adj if total_adj else 0
         pay = round(share * BANK_RYO, 2)
 
-        data_rows.append([
+        output.append([
             i, medic, raw_pts, jobs, rank_title, mult,
             round(adj_pts, 2), pay,
             BANK_RYO if i == 1 else ""
         ])
 
-    leaderboard_sheet.update('A3', data_rows)
+    leaderboard_sheet.clear()
+    leaderboard_sheet.update(output)
+
     print(f"Updated leaderboard: {sheet_title}")
 
 
@@ -351,6 +334,8 @@ def update_all_leaderboards():
     for year, month in months:
         month_name = datetime(year, month, 1).strftime("%b")
         title = f"Leaderboard - {month_name} {year}"
+
+        # Temporarily override datetime.now() behavior
         print(f"📅 Updating leaderboard for: {title}")
         update_single_leaderboard(year, month)
 
@@ -473,7 +458,7 @@ bot = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(bot)
 
 
-# ================= /updatelogs (ALL LEADERBOARDS + MASTER LOG) =================
+# ================= Update ALL leaderboards =================
 @tree.command(name="updatelogs", description="Force update ALL leaderboard sheets and the master log.")
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
 async def update_logs(interaction: discord.Interaction):
@@ -484,7 +469,6 @@ async def update_logs(interaction: discord.Interaction):
         await interaction.followup.send("✅ All logs and leaderboards updated!")
     except Exception as e:
         await interaction.followup.send(f"⚠️ Error: {e}")
-
 
 # ---------- /leaderboard (monthly) ----------
 @tree.command(name="leaderboard", description="Show this month's medic leaderboard")
@@ -518,7 +502,6 @@ async def leaderboard_cmd(interaction: discord.Interaction):
 
     except Exception as e:
         await interaction.followup.send(f"⚠️ Error loading leaderboard: {e}")
-
 
 # ---------- /medicstats (lifetime) ----------
 @tree.command(name="medicstats", description="View lifetime stats for a specific medic")
@@ -621,23 +604,10 @@ async def report(interaction: discord.Interaction):
             job_type = self.values[0]
 
             class ReportModal(discord.ui.Modal, title="Medic Job Report"):
-                medics = discord.ui.TextInput(
-                    label="Medic Names (separate by ,)",
-                    placeholder="Example: Leumas, LeaKiara, Ragnor Reaper"
-                )
-                date = discord.ui.TextInput(
-                    label="Date (blank = today, MM/DD/YYYY)",
-                    required=False,
-                    placeholder="01/15/2025"
-                )
-                time_range = discord.ui.TextInput(
-                    label="Time Range (HH:MM or H:MM AM/PM)",
-                    placeholder="5:00 pm - 6:00 pm"
-                )
-                clients = discord.ui.TextInput(
-                    label="Clients (separate by ,)",
-                    placeholder="Example: Leumas, LeaKiara, Ragnor Reaper"
-                )
+                medics = discord.ui.TextInput(label="Medic Names(Separate by ,)", placeholder="Example: Leumas, LeaKiara, Ragnor Reaper")
+                date = discord.ui.TextInput(label="Date (blank = today, MM/DD/YYYY)", required=False, placeholder="01/15/2025")
+                time_range = discord.ui.TextInput(label="Time Range (HH:MM or H:MM AM/PM)", placeholder="5:00 pm - 6:00 pm")
+                clients = discord.ui.TextInput(label="Clients(Separate by ,)", placeholder="Example: Leumas, LeaKiara, Ragnor Reaper")
                 description = discord.ui.TextInput(
                     label="Description", style=discord.TextStyle.long
                 )
@@ -684,13 +654,6 @@ async def report(interaction: discord.Interaction):
 
                         # Parse time range
                         t = re.split(r"-|to", self.time_range.value)
-                        if len(t) < 2:
-                            await modal_interaction.followup.send(
-                                "⚠️ Invalid time range. Use `start - end`.",
-                                ephemeral=True,
-                            )
-                            return
-
                         start = self.parse_time(t[0])
                         end = self.parse_time(t[1])
 
@@ -747,7 +710,7 @@ async def report(interaction: discord.Interaction):
                             value_input_option="USER_ENTERED",
                         )
 
-                        # Update monthly leaderboard & master log (current month only)
+                        # Update monthly leaderboard & master log
                         update_master_log()
                         update_leaderboard()
 
