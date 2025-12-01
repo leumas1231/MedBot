@@ -114,7 +114,6 @@ def update_leaderboard():
     current_month_name = now.strftime("%b")
 
     sheet_title = f"Leaderboard - {current_month_name} {current_year}"
-    BANK_RYO = 5000
 
     ss = GC.open_by_key(SPREADSHEET_ID)
 
@@ -220,7 +219,6 @@ def update_single_leaderboard(year: int, month: int):
     records = SHEET.get_all_records()
 
     sheet_title = f"Leaderboard - {datetime(year, month, 1).strftime('%b')} {year}"
-    BANK_RYO = 5000
 
     # Load ranks
     try:
