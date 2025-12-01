@@ -360,10 +360,10 @@ def update_master_log():
         existing_ranks = {}
         master.update([[
             "Medic", "Rank", "Total Jobs", "Total Raw Points",
-            "Total Adjusted Points", "Total Hours", "Raid Hours",
-            "LMPF Hours", "Healing Hours", "Rev/Spar Hours",
-            "Escort Hours", "World Boss Hours", "Arc Hours",
-            "Mission Hours", "Hosted Event Hours"
+            "Total Adjusted Points", "Total Hours", "Raid",
+            "LMPF", "Healing", "Rev/Spar",
+            "Escort", "World Boss", "Arc",
+            "Mission", "Hosted Event"
         ]])
 
     records = SHEET.get_all_records()
@@ -416,10 +416,10 @@ def update_master_log():
 
     output = [[
         "Medic", "Rank", "Total Jobs", "Total Raw Points",
-        "Total Adjusted Points", "Total Hours", "Raid Hours",
-        "LMPF Hours", "Healing Hours", "Rev/Spar Hours",
-        "Escort Hours", "World Boss Hours", "Arc Hours",
-        "Mission Hours", "Hosted Event Hours"
+        "Total Adjusted Points", "Total Hours", "Raid",
+        "LMPF", "Healing", "Rev/Spar",
+        "Escort", "World Boss", "Arc",
+        "Mission", "Hosted Event"
     ]]
 
     for medic in sorted(jobs.keys()):
