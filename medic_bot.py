@@ -536,15 +536,15 @@ async def medicstats(interaction: discord.Interaction, name: str):
         adj = target.get("Total Adjusted Points", 0)
         hours = target.get("Total Hours", 0)
 
-        raid_h = target.get("Raid Hours", 0)
-        lmpf_h = target.get("LMPF Hours", 0)
-        heal_h = target.get("Healing Hours", 0)
-        rev_h = target.get("Rev/Spar Hours", 0)
-        escort_h = target.get("Escort Hours", 0)
-        boss_h = target.get("World Boss Hours", 0)
-        arc_h = target.get("Arc Hours", 0)
-        mission_h = target.get("Mission Hours", 0)
-        event_h = target.get("Hosted Event Hours", 0)
+        raid_h = target.get("Raid", 0)
+        lmpf_h = target.get("LMPF", 0)
+        heal_h = target.get("Healing", 0)
+        rev_h = target.get("Rev/Spar", 0)
+        escort_h = target.get("Escort", 0)
+        boss_h = target.get("World Boss", 0)
+        arc_h = target.get("Arc", 0)
+        mission_h = target.get("Mission", 0)
+        event_h = target.get("Hosted Event", 0)
 
         embed = discord.Embed(
             title=f"💠 Lifetime Stats — {medic}",
