@@ -360,8 +360,6 @@ def update_all_leaderboards():
 
 def update_master_log():
     ss = GC.open_by_key(SPREADSHEET_ID)
-    print("DEBUG: raw rows =", len(records))
-    print("DEBUG: first row keys =", records[0].keys() if records else "NO ROWS")
 
     # Ensure master sheet exists & capture existing ranks
     try:
@@ -384,6 +382,10 @@ def update_master_log():
         ]])
 
     records = SHEET.get_all_records()
+
+    
+    print("DEBUG: raw rows =", len(records))
+    print("DEBUG: first row keys =", records[0].keys() if records else "NO ROWS")
 
     raw_points = defaultdict(int)
     jobs = defaultdict(int)
