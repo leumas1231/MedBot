@@ -365,11 +365,17 @@ def update_master_log():
     try:
         master = ss.worksheet("Leaf Master Medical Log")
         existing_records = master.get_all_records()
-        existing_ranks = {
-            row.get("Medic", "").strip(): row.get("Rank", "Unranked")
-            for row in existing_records
-            if row.get("Medic", "").strip()
-        }
+        existing_ranks = {}
+
+        name_map = load_medic_normalization()
+
+        for row in existing_records:
+            raw_name = row.get("Medic", "").strip()
+            if not raw_name:
+                continue
+
+            normalized = normalize_medic_name(raw_name, name_map)
+            existing_ranks[normalized] = row.get("Rank", "Unranked")
     except gspread.exceptions.WorksheetNotFound:
         master = ss.add_worksheet(title="Leaf Master Medical Log", rows="300", cols="20")
         existing_ranks = {}
@@ -466,6 +472,13 @@ def update_master_log():
     if len(output) <= 1:
         print("🚫 Master log rebuild aborted — no parsed data")
         return
+
+    if len(existing_ranks) > 0:
+        master.clear()
+        master.update(output)
+    else:
+        print("🚫 Aborting master log rebuild — ranks would be lost")
+
 
     master.clear()
     master.update(output)
