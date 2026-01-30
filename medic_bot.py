@@ -220,7 +220,7 @@ def update_single_leaderboard(year: int, month: int):
     records = SHEET.get_all_records()
 
     sheet_title = f"Leaderboard - {datetime(year, month, 1).strftime('%b')} {year}"
-    BANK_RYO = 20000
+    BANK_RYO = 25000
 
     # Load ranks
     try:
