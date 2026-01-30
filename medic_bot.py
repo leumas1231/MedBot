@@ -4,24 +4,58 @@ import gspread
 import os
 import json
 from dotenv import load_dotenv
-load_dotenv()
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from collections import defaultdict
 
+load_dotenv()
+
 # ================= CONFIG =================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = 1439473833273856120                   # text channel if needed
+CHANNEL_ID = 1439473833273856120  # text channel if needed
 SPREADSHEET_ID = "1aXhvKbXqXlHEu94dQctSJP8jk6tLvNWkrYHZyDYcI0c"
-GUILD_ID = 861362652710174740                   # your real server (guild) ID
+GUILD_ID = 861362652710174740  # your real server (guild) ID
 
-# Google Sheets auth
+# ================= RYO (PER-MONTH) =================
+RYO_FILE = "monthly_ryo.json"
+monthly_ryo = {}  # {"2026-01": 25000, ...}
+
+DEFAULT_RYO = 25000  # fallback if month not set
+
+
+def load_monthly_ryo():
+    global monthly_ryo
+    if os.path.exists(RYO_FILE):
+        try:
+            with open(RYO_FILE, "r") as f:
+                monthly_ryo = json.load(f) or {}
+        except Exception:
+            monthly_ryo = {}
+    else:
+        monthly_ryo = {}
+
+
+def save_monthly_ryo():
+    with open(RYO_FILE, "w") as f:
+        json.dump(monthly_ryo, f, indent=2)
+
+
+def get_month_key(year: int, month: int) -> str:
+    return f"{year}-{month:02d}"
+
+
+def get_bank_ryo(year: int, month: int) -> int:
+    return int(monthly_ryo.get(get_month_key(year, month), DEFAULT_RYO))
+
+
+# Load on startup so /setryo persists across restarts
+load_monthly_ryo()
+
+# ================= GOOGLE SHEETS AUTH =================
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-# Instead of GOOGLE_CREDENTIALS
 CREDS = Credentials.from_service_account_file(
     os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
-    scopes=SCOPES
+    scopes=SCOPES,
 )
 
 GC = gspread.authorize(CREDS)
@@ -51,11 +85,10 @@ def normalize_medic_name(name: str, mapping: dict) -> str:
     key = name.lower()
     if key in mapping:
         return mapping[key]  # already known medic → use canonical case
-    else:
-        # New medic never seen before → Title Case
-        proper = name.title()
-        mapping[key] = proper
-        return proper
+
+    proper = name.title()
+    mapping[key] = proper
+    return proper
 
 
 # ================= POINT CALCULATOR =================
@@ -88,7 +121,7 @@ def calculate_points(job_name: str, duration: int, clients: int) -> int:
     return 0
 
 
-# ================= RANK BONUS (BASED ON MANUAL RANK) =================
+# ================= RANK BONUS =================
 def bonus_from_rank(rank: str) -> float:
     """Return bonus multiplier based on Rank string from Master Log."""
     r = (rank or "").lower()
@@ -114,7 +147,7 @@ def update_leaderboard():
     current_month_name = now.strftime("%b")
 
     sheet_title = f"Leaderboard - {current_month_name} {current_year}"
-    BANK_RYO = 25000
+    BANK_RYO = get_bank_ryo(current_year, current_month)
 
     ss = GC.open_by_key(SPREADSHEET_ID)
 
@@ -128,16 +161,13 @@ def update_leaderboard():
             if medic_name:
                 rank_by_medic[medic_name] = row.get("Rank", "Unranked")
     except gspread.exceptions.WorksheetNotFound:
-        # No master sheet yet; everyone effectively Unranked
         rank_by_medic = {}
 
     # Create or open the monthly leaderboard sheet
     try:
         leaderboard_sheet = ss.worksheet(sheet_title)
     except gspread.exceptions.WorksheetNotFound:
-        leaderboard_sheet = ss.add_worksheet(
-            title=sheet_title, rows="200", cols="10"
-        )
+        leaderboard_sheet = ss.add_worksheet(title=sheet_title, rows="200", cols="10")
         leaderboard_sheet.update([[
             "Rank", "Medic", "Raw Points", "Jobs Logged",
             "Rank Title", "Bonus Multiplier",
@@ -168,12 +198,11 @@ def update_leaderboard():
                 points_by_medic[medic] += points
                 jobs_by_medic[medic] += 1
 
+    # IMPORTANT: Never clear/overwrite a leaderboard if there is no data
     if not points_by_medic:
-        leaderboard_sheet.clear()
-        leaderboard_sheet.update([["No data for this month."]])
+        print("⚠️ No data for current month — leaderboard left unchanged")
         return [], {}
 
-    # Adjust with rank bonuses (from Master Log Rank)
     adjusted_points = {}
     for medic, raw in points_by_medic.items():
         rank = rank_by_medic.get(medic, "Unranked")
@@ -212,15 +241,16 @@ def update_leaderboard():
     leaderboard_sheet.clear()
     leaderboard_sheet.update(output)
 
-    print(f"✅ Leaderboard updated for {current_month_name} {current_year}")
+    print(f"✅ Leaderboard updated for {current_month_name} {current_year} (Pool: {BANK_RYO})")
     return sorted_data, jobs_by_medic
+
 
 def update_single_leaderboard(year: int, month: int):
     ss = GC.open_by_key(SPREADSHEET_ID)
     records = SHEET.get_all_records()
+    BANK_RYO = get_bank_ryo(year, month)
 
     sheet_title = f"Leaderboard - {datetime(year, month, 1).strftime('%b')} {year}"
-    BANK_RYO = 25000
 
     # Load ranks
     try:
@@ -238,12 +268,6 @@ def update_single_leaderboard(year: int, month: int):
         leaderboard_sheet = ss.worksheet(sheet_title)
     except gspread.exceptions.WorksheetNotFound:
         leaderboard_sheet = ss.add_worksheet(sheet_title, rows=200, cols=10)
-    leaderboard_sheet.update([[
-        "Rank", "Medic", "Raw Points", "Jobs Logged",
-        "Rank Title", "Bonus Multiplier",
-        "Adjusted Points", "Total Pay", "Total Ryo"
-    ]])
-
 
     # Collect raw data for this month
     points_by_medic = defaultdict(int)
@@ -261,15 +285,18 @@ def update_single_leaderboard(year: int, month: int):
 
         if d.year == year and d.month == month:
             medics = [m.strip() for m in row.get("Medics", "").split(",") if m.strip()]
-            pts = int(row.get("Points", 0))
+            try:
+                pts = int(row.get("Points", 0))
+            except ValueError:
+                pts = 0
 
             for medic in medics:
                 points_by_medic[medic] += pts
                 jobs_by_medic[medic] += 1
 
-    # If empty month
+    # IMPORTANT: do NOT clear/overwrite if empty
     if not points_by_medic:
-        leaderboard_sheet.update([["No data for this month."]])
+        print(f"⚠️ No data for {sheet_title} — skipping update")
         return
 
     adjusted = {}
@@ -305,37 +332,26 @@ def update_single_leaderboard(year: int, month: int):
     leaderboard_sheet.clear()
     leaderboard_sheet.update(output)
 
-    print(f"Updated leaderboard: {sheet_title}")
+    print(f"✅ Updated leaderboard: {sheet_title} (Pool: {BANK_RYO})")
 
 
 def update_all_leaderboards():
     """Rebuild leaderboard sheets for every month found in the raw log."""
-    ss = GC.open_by_key(SPREADSHEET_ID)
     records = SHEET.get_all_records()
 
-    # Find all months with data
     months = set()
-
     for row in records:
         date_str = str(row.get("Report Date", "")).strip()
         if not date_str:
             continue
-
         try:
             d = datetime.strptime(date_str, "%m/%d/%Y")
             months.add((d.year, d.month))
         except ValueError:
             continue
 
-    # Sort oldest → newest
-    months = sorted(months)
-
-    # Rebuild the leaderboard for each month
-    for year, month in months:
-        month_name = datetime(year, month, 1).strftime("%b")
-        title = f"Leaderboard - {month_name} {year}"
-
-        # Temporarily override datetime.now() behavior
+    for year, month in sorted(months):
+        title = f"Leaderboard - {datetime(year, month, 1).strftime('%b')} {year}"
         print(f"📅 Updating leaderboard for: {title}")
         update_single_leaderboard(year, month)
 
@@ -354,9 +370,7 @@ def update_master_log():
             if row.get("Medic", "").strip()
         }
     except gspread.exceptions.WorksheetNotFound:
-        master = ss.add_worksheet(
-            title="Leaf Master Medical Log", rows="300", cols="20"
-        )
+        master = ss.add_worksheet(title="Leaf Master Medical Log", rows="300", cols="20")
         existing_ranks = {}
         master.update([[
             "Medic", "Rank", "Total Jobs", "Total Raw Points",
@@ -381,7 +395,6 @@ def update_master_log():
         except ValueError:
             points = 0
 
-        # Duration like "45 min"
         duration_str = str(row.get("Duration", "0 min"))
         try:
             minutes = int(duration_str.split()[0])
@@ -458,7 +471,7 @@ bot = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(bot)
 
 
-# ================= Update ALL leaderboards =================
+# ================= COMMANDS =================
 @tree.command(name="updatelogs", description="Force update ALL leaderboard sheets and the master log.")
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
 async def update_logs(interaction: discord.Interaction):
@@ -470,12 +483,71 @@ async def update_logs(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"⚠️ Error: {e}")
 
-# ---------- /leaderboard (monthly) ----------
+
+@tree.command(
+    name="rebuildleaderboard",
+    description="Rebuild a specific month's leaderboard (admin use)"
+)
+@discord.app_commands.describe(year="Year (e.g. 2026)", month="Month number (1–12)")
+@discord.app_commands.guilds(discord.Object(id=GUILD_ID))
+async def rebuild_leaderboard(interaction: discord.Interaction, year: int, month: int):
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("🚫 Admins only.")
+        return
+
+    if month < 1 or month > 12:
+        await interaction.followup.send("❌ Month must be between 1 and 12.")
+        return
+
+    try:
+        update_single_leaderboard(year, month)
+        month_name = datetime(year, month, 1).strftime("%B")
+        await interaction.followup.send(f"✅ Rebuilt leaderboard for **{month_name} {year}**")
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error rebuilding leaderboard: {e}")
+
+
+@tree.command(
+    name="setryo",
+    description="Set Ryo payout for a specific month (admin only)"
+)
+@discord.app_commands.describe(
+    year="Year (e.g. 2026)",
+    month="Month (1–12)",
+    amount="Total Ryo for that month"
+)
+@discord.app_commands.guilds(discord.Object(id=GUILD_ID))
+async def set_ryo(interaction: discord.Interaction, year: int, month: int, amount: int):
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("🚫 Admins only.")
+        return
+
+    if month < 1 or month > 12:
+        await interaction.followup.send("❌ Month must be 1–12.")
+        return
+
+    if amount <= 0:
+        await interaction.followup.send("❌ Ryo must be positive.")
+        return
+
+    key = get_month_key(year, month)
+    monthly_ryo[key] = amount
+    save_monthly_ryo()
+
+    month_name = datetime(year, month, 1).strftime("%B")
+    await interaction.followup.send(
+        f"💰 Ryo for **{month_name} {year}** set to **{amount:,} Ryo**"
+    )
+
+
 @tree.command(name="leaderboard", description="Show this month's medic leaderboard")
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
 async def leaderboard_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
-
     try:
         sorted_data, jobs_by_medic = update_leaderboard()
 
@@ -488,22 +560,18 @@ async def leaderboard_cmd(interaction: discord.Interaction):
             job_count = jobs_by_medic.get(medic, 0)
             lines.append(f"**{i}. {medic}** — {points} pts ({job_count} jobs)")
 
-        leaderboard_text = "\n".join(lines)
-        now = datetime.now()
-
         embed = discord.Embed(
-            title=f"🏆 Medic Leaderboard — {now.strftime('%B %Y')}",
-            description=leaderboard_text,
+            title=f"🏆 Medic Leaderboard — {datetime.now().strftime('%B %Y')}",
+            description="\n".join(lines),
             color=0xFFD700,
         )
         embed.set_footer(text="Data pulled from Google Sheets")
-
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
         await interaction.followup.send(f"⚠️ Error loading leaderboard: {e}")
 
-# ---------- /medicstats (lifetime) ----------
+
 @tree.command(name="medicstats", description="View lifetime stats for a specific medic")
 @discord.app_commands.describe(name="The medic's name")
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
@@ -546,17 +614,12 @@ async def medicstats(interaction: discord.Interaction, name: str):
         mission_h = target.get("Mission", 0)
         event_h = target.get("Hosted Event", 0)
 
-        embed = discord.Embed(
-            title=f"💠 Lifetime Stats — {medic}",
-            color=0x3498DB,
-        )
-
+        embed = discord.Embed(title=f"💠 Lifetime Stats — {medic}", color=0x3498DB)
         embed.add_field(name="Rank", value=rank, inline=True)
         embed.add_field(name="Total Jobs", value=jobs, inline=True)
         embed.add_field(name="Total Raw Points", value=raw, inline=True)
         embed.add_field(name="Total Adjusted Points", value=adj, inline=True)
         embed.add_field(name="Total Hours", value=hours, inline=True)
-
         embed.add_field(
             name="Hours Breakdown",
             value=(
@@ -572,7 +635,6 @@ async def medicstats(interaction: discord.Interaction, name: str):
             ),
             inline=False,
         )
-
         embed.set_footer(text="Lifetime stats from the Master Medical Log")
         await interaction.followup.send(embed=embed)
 
@@ -580,7 +642,6 @@ async def medicstats(interaction: discord.Interaction, name: str):
         await interaction.followup.send(f"⚠️ Error: {e}")
 
 
-# ---------- /report ----------
 @tree.command(name="report", description="Submit a medic report")
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
 async def report(interaction: discord.Interaction):
@@ -604,10 +665,23 @@ async def report(interaction: discord.Interaction):
             job_type = self.values[0]
 
             class ReportModal(discord.ui.Modal, title="Medic Job Report"):
-                medics = discord.ui.TextInput(label="Medic Names(Separate by ,)", placeholder="Example: Leumas, LeaKiara, Ragnor Reaper")
-                date = discord.ui.TextInput(label="Date (blank = today, MM/DD/YYYY)", required=False, placeholder="01/15/2025")
-                time_range = discord.ui.TextInput(label="Time Range (HH:MM or H:MM AM/PM)", placeholder="5:00 pm - 6:00 pm")
-                clients = discord.ui.TextInput(label="Clients(Separate by ,)", placeholder="Example: Leumas, LeaKiara, Ragnor Reaper")
+                medics = discord.ui.TextInput(
+                    label="Medic Names(Separate by ,)",
+                    placeholder="Example: Leumas, LeaKiara, Ragnor Reaper",
+                )
+                date = discord.ui.TextInput(
+                    label="Date (blank = today, MM/DD/YYYY)",
+                    required=False,
+                    placeholder="01/15/2025",
+                )
+                time_range = discord.ui.TextInput(
+                    label="Time Range (HH:MM or H:MM AM/PM)",
+                    placeholder="5:00 pm - 6:00 pm",
+                )
+                clients = discord.ui.TextInput(
+                    label="Clients(Separate by ,)",
+                    placeholder="Example: Leumas, LeaKiara, Ragnor Reaper",
+                )
                 description = discord.ui.TextInput(
                     label="Description", style=discord.TextStyle.long
                 )
@@ -632,7 +706,6 @@ async def report(interaction: discord.Interaction):
                     try:
                         await modal_interaction.response.defer(ephemeral=True)
 
-                        # Load normalization table and normalize medic names
                         name_map = load_medic_normalization()
                         medic_list = [
                             normalize_medic_name(m.strip(), name_map)
@@ -652,7 +725,6 @@ async def report(interaction: discord.Interaction):
                             else datetime.now().date()
                         )
 
-                        # Parse time range
                         t = re.split(r"-|to", self.time_range.value)
                         start = self.parse_time(t[0])
                         end = self.parse_time(t[1])
@@ -679,13 +751,9 @@ async def report(interaction: discord.Interaction):
                             color=0x00FFAA,
                         )
                         embed.add_field(name="Date", value=date_obj.strftime("%B %d, %Y"))
-                        embed.add_field(
-                            name="Medics", value=", ".join(medic_list), inline=False
-                        )
+                        embed.add_field(name="Medics", value=", ".join(medic_list), inline=False)
                         embed.add_field(name="Duration", value=f"{duration} min")
-                        embed.add_field(
-                            name="Clients", value=str(len(clients_list))
-                        )
+                        embed.add_field(name="Clients", value=str(len(clients_list)))
                         embed.add_field(name="Points", value=str(points))
                         embed.timestamp = datetime.now()
 
@@ -710,7 +778,6 @@ async def report(interaction: discord.Interaction):
                             value_input_option="USER_ENTERED",
                         )
 
-                        # Update monthly leaderboard & master log
                         update_master_log()
                         update_leaderboard()
 
@@ -720,10 +787,7 @@ async def report(interaction: discord.Interaction):
                         )
 
                     except Exception as e:
-                        await modal_interaction.followup.send(
-                            f"⚠️ Error: {e}",
-                            ephemeral=True,
-                        )
+                        await modal_interaction.followup.send(f"⚠️ Error: {e}", ephemeral=True)
 
             await select_interaction.response.send_modal(ReportModal())
 
