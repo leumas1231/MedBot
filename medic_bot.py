@@ -357,8 +357,11 @@ def update_all_leaderboards():
 
 
 # ================= MASTER LOG (LIFETIME) =================
+
 def update_master_log():
     ss = GC.open_by_key(SPREADSHEET_ID)
+    print("DEBUG: raw rows =", len(records))
+    print("DEBUG: first row keys =", records[0].keys() if records else "NO ROWS")
 
     # Ensure master sheet exists & capture existing ranks
     try:
@@ -458,8 +461,13 @@ def update_master_log():
             round(hours_by_type[medic]["Hosted Event"], 2),
         ])
 
+    if len(output) <= 1:
+        print("🚫 Master log rebuild aborted — no parsed data")
+        return
+
     master.clear()
     master.update(output)
+
     print("✅ Leaf Master Medical Log updated")
 
 
