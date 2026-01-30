@@ -114,7 +114,7 @@ def update_leaderboard():
     current_month_name = now.strftime("%b")
 
     sheet_title = f"Leaderboard - {current_month_name} {current_year}"
-    BANK_RYO = 20000
+    BANK_RYO = 25000
 
     ss = GC.open_by_key(SPREADSHEET_ID)
 
