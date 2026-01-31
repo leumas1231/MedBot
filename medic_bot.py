@@ -15,6 +15,13 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = 1439473833273856120  # text channel if needed
 SPREADSHEET_ID = "1aXhvKbXqXlHEu94dQctSJP8jk6tLvNWkrYHZyDYcI0c"
 GUILD_ID = 861362652710174740  # your real server (guild) ID
+VALID_RANKS = [
+    "Field Medic",
+    "Junior Medic",
+    "Senior Medic",
+    "Paramedic",
+    "Doctor",
+]
 
 # ================= RYO (PER-MONTH) =================
 RYO_FILE = "monthly_ryo.json"
@@ -485,6 +492,41 @@ def update_master_log():
 
     print("✅ Leaf Master Medical Log updated")
 
+def set_rank_in_master_log(medic_name: str, rank: str) -> str:
+    ss = GC.open_by_key(SPREADSHEET_ID)
+    master = ss.worksheet("Leaf Master Medical Log")
+
+    # Normalize medic name
+    name_map = load_medic_normalization()
+    medic = normalize_medic_name(medic_name.strip(), name_map)
+
+    # Normalize rank to canonical value
+    rank = next((r for r in VALID_RANKS if r.lower() == rank.lower()), None)
+    if not rank:
+        raise ValueError("Invalid rank")
+
+    records = master.get_all_records()
+
+    target_row = None
+    for i, row in enumerate(records, start=2):
+        existing = str(row.get("Medic", "")).strip()
+        if not existing:
+            continue
+
+        existing_norm = normalize_medic_name(existing, name_map)
+        if existing_norm.lower() == medic.lower():
+            target_row = i
+            break
+
+    if target_row is None:
+        master.append_row([medic, rank], value_input_option="USER_ENTERED")
+        return f"Added **{medic}** with rank **{rank}**."
+    else:
+        master.update_cell(target_row, 2, rank)
+        return f"Updated **{medic}** rank to **{rank}**."
+
+
+
 
 # ================= DISCORD BOT =================
 intents = discord.Intents.default()
@@ -495,6 +537,54 @@ tree = discord.app_commands.CommandTree(bot)
 
 
 # ================= COMMANDS =================
+
+@tree.command(
+    name="setrank",
+    description="Set a medic's rank in the Master Medical Log (admin only)"
+)
+@discord.app_commands.describe(
+    medic="Medic name (case-insensitive)",
+    rank="Select the medic's rank"
+)
+@discord.app_commands.choices(
+    rank=[
+
+        discord.app_commands.Choice(name="Field Medic", value="Field Medic"),
+        discord.app_commands.Choice(name="Junior Medic", value="Junior Medic"),
+                discord.app_commands.Choice(name="Senior Medic", value="Senior Medic"),
+        discord.app_commands.Choice(name="Paramedic", value="Paramedic"),
+        discord.app_commands.Choice(name="Doctor", value="Doctor"),
+    ]
+)
+@discord.app_commands.guilds(discord.Object(id=GUILD_ID))
+async def setrank(
+    interaction: discord.Interaction,
+    medic: str,
+    rank: discord.app_commands.Choice[str],
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("🚫 Admins only.")
+        return
+
+    try:
+        msg = set_rank_in_master_log(medic, rank.value)
+
+        # Recalculate derived data immediately
+        update_master_log()
+        update_leaderboard()
+
+        await interaction.followup.send(
+            f"✅ {msg}\nBonus applied: **×{bonus_from_rank(rank.value)}**"
+        )
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error setting rank: {e}")
+
+
+
+
+
 @tree.command(name="updatelogs", description="Force update ALL leaderboard sheets and the master log.")
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
 async def update_logs(interaction: discord.Interaction):
