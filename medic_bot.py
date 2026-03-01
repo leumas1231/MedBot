@@ -3,6 +3,8 @@ import re
 import gspread
 import os
 import json
+import time
+import threading
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
@@ -26,7 +28,6 @@ VALID_RANKS = [
 # ================= RYO (PER-MONTH) =================
 RYO_FILE = "monthly_ryo.json"
 monthly_ryo = {}  # {"2026-01": 25000, ...}
-
 DEFAULT_RYO = 25000  # fallback if month not set
 
 
@@ -66,16 +67,80 @@ CREDS = Credentials.from_service_account_file(
 )
 
 GC = gspread.authorize(CREDS)
-SHEET = GC.open_by_key(SPREADSHEET_ID).sheet1  # first worksheet with raw logs
+
+# IMPORTANT: open spreadsheet ONCE and reuse it
+SS = GC.open_by_key(SPREADSHEET_ID)
+SHEET = SS.sheet1  # first worksheet with raw logs
 
 # Expected header row in the first sheet:
 # Timestamp | Medics | Job Name | Duration | Points | Clients | Participant Names | Description | Report Date | Message Link
 
 
+# ================= API READ CACHING (QUOTA FIX) =================
+_RAW_CACHE = {"ts": 0.0, "records": []}
+_RAW_CACHE_TTL = 30  # seconds
+_RAW_LOCK = threading.Lock()
+
+_MASTER_CACHE = {"ts": 0.0, "records": []}
+_MASTER_TTL = 30  # seconds
+_MASTER_LOCK = threading.Lock()
+
+
+def get_raw_records_cached(force: bool = False):
+    """Return SHEET.get_all_records(), but cache for TTL seconds to avoid quota spikes."""
+    now = time.time()
+    with _RAW_LOCK:
+        if (not force) and _RAW_CACHE["records"] and (now - _RAW_CACHE["ts"] < _RAW_CACHE_TTL):
+            return _RAW_CACHE["records"]
+
+        records = SHEET.get_all_records()
+        _RAW_CACHE["records"] = records
+        _RAW_CACHE["ts"] = now
+        return records
+
+
+def invalidate_raw_cache():
+    with _RAW_LOCK:
+        _RAW_CACHE["ts"] = 0.0
+        _RAW_CACHE["records"] = []
+
+
+def get_master_records_cached(master_ws, force: bool = False):
+    """Cache master worksheet get_all_records too."""
+    now = time.time()
+    with _MASTER_LOCK:
+        if (not force) and _MASTER_CACHE["records"] and (now - _MASTER_CACHE["ts"] < _MASTER_TTL):
+            return _MASTER_CACHE["records"]
+
+        recs = master_ws.get_all_records()
+        _MASTER_CACHE["records"] = recs
+        _MASTER_CACHE["ts"] = now
+        return recs
+
+
+def invalidate_master_cache():
+    with _MASTER_LOCK:
+        _MASTER_CACHE["ts"] = 0.0
+        _MASTER_CACHE["records"] = []
+
+
+# ================= REBUILD THROTTLE (QUOTA FIX) =================
+_LAST_REBUILD = {"master": 0.0, "leaderboard": 0.0}
+REBUILD_COOLDOWN = 60  # seconds
+
+
+def should_run(key: str) -> bool:
+    now = time.time()
+    if now - _LAST_REBUILD[key] >= REBUILD_COOLDOWN:
+        _LAST_REBUILD[key] = now
+        return True
+    return False
+
+
 # ================= NAME NORMALIZATION =================
 def load_medic_normalization():
-    """Reads all medic names from the sheet & builds a normalization map."""
-    records = SHEET.get_all_records()
+    """Reads medic names from cached raw records & builds a normalization map."""
+    records = get_raw_records_cached()
     mapping = {}
 
     for row in records:
@@ -147,7 +212,7 @@ def bonus_from_rank(rank: str) -> float:
 
 # ================= MONTHLY LEADERBOARD =================
 def update_leaderboard():
-    records = SHEET.get_all_records()
+    records = get_raw_records_cached()
     now = datetime.now()
     current_month = now.month
     current_year = now.year
@@ -156,13 +221,11 @@ def update_leaderboard():
     sheet_title = f"Leaderboard - {current_month_name} {current_year}"
     BANK_RYO = get_bank_ryo(current_year, current_month)
 
-    ss = GC.open_by_key(SPREADSHEET_ID)
-
     # Load ranks from Master Log (if exists)
     rank_by_medic = {}
     try:
-        master = ss.worksheet("Leaf Master Medical Log")
-        master_records = master.get_all_records()
+        master = SS.worksheet("Leaf Master Medical Log")
+        master_records = get_master_records_cached(master)
         for row in master_records:
             medic_name = row.get("Medic", "").strip()
             if medic_name:
@@ -172,9 +235,9 @@ def update_leaderboard():
 
     # Create or open the monthly leaderboard sheet
     try:
-        leaderboard_sheet = ss.worksheet(sheet_title)
+        leaderboard_sheet = SS.worksheet(sheet_title)
     except gspread.exceptions.WorksheetNotFound:
-        leaderboard_sheet = ss.add_worksheet(title=sheet_title, rows="200", cols="10")
+        leaderboard_sheet = SS.add_worksheet(title=sheet_title, rows="200", cols="10")
         leaderboard_sheet.update([[
             "Rank", "Medic", "Raw Points", "Jobs Logged",
             "Rank Title", "Bonus Multiplier",
@@ -253,16 +316,15 @@ def update_leaderboard():
 
 
 def update_single_leaderboard(year: int, month: int):
-    ss = GC.open_by_key(SPREADSHEET_ID)
-    records = SHEET.get_all_records()
+    records = get_raw_records_cached()
     BANK_RYO = get_bank_ryo(year, month)
 
     sheet_title = f"Leaderboard - {datetime(year, month, 1).strftime('%b')} {year}"
 
     # Load ranks
     try:
-        master = ss.worksheet("Leaf Master Medical Log")
-        master_records = master.get_all_records()
+        master = SS.worksheet("Leaf Master Medical Log")
+        master_records = get_master_records_cached(master)
         rank_by_medic = {
             row.get("Medic", ""): row.get("Rank", "Unranked")
             for row in master_records
@@ -272,9 +334,9 @@ def update_single_leaderboard(year: int, month: int):
 
     # Create or open the sheet
     try:
-        leaderboard_sheet = ss.worksheet(sheet_title)
+        leaderboard_sheet = SS.worksheet(sheet_title)
     except gspread.exceptions.WorksheetNotFound:
-        leaderboard_sheet = ss.add_worksheet(sheet_title, rows=200, cols=10)
+        leaderboard_sheet = SS.add_worksheet(sheet_title, rows=200, cols=10)
 
     # Collect raw data for this month
     points_by_medic = defaultdict(int)
@@ -344,7 +406,7 @@ def update_single_leaderboard(year: int, month: int):
 
 def update_all_leaderboards():
     """Rebuild leaderboard sheets for every month found in the raw log."""
-    records = SHEET.get_all_records()
+    records = get_raw_records_cached()
 
     months = set()
     for row in records:
@@ -364,14 +426,11 @@ def update_all_leaderboards():
 
 
 # ================= MASTER LOG (LIFETIME) =================
-
 def update_master_log():
-    ss = GC.open_by_key(SPREADSHEET_ID)
-
     # Ensure master sheet exists & capture existing ranks
     try:
-        master = ss.worksheet("Leaf Master Medical Log")
-        existing_records = master.get_all_records()
+        master = SS.worksheet("Leaf Master Medical Log")
+        existing_records = get_master_records_cached(master)
         existing_ranks = {}
 
         name_map = load_medic_normalization()
@@ -384,7 +443,7 @@ def update_master_log():
             normalized = normalize_medic_name(raw_name, name_map)
             existing_ranks[normalized] = row.get("Rank", "Unranked")
     except gspread.exceptions.WorksheetNotFound:
-        master = ss.add_worksheet(title="Leaf Master Medical Log", rows="300", cols="20")
+        master = SS.add_worksheet(title="Leaf Master Medical Log", rows="300", cols="20")
         existing_ranks = {}
         master.update([[
             "Medic", "Rank", "Total Jobs", "Total Raw Points",
@@ -393,10 +452,10 @@ def update_master_log():
             "Escort", "World Boss", "Arc",
             "Mission", "Hosted Event"
         ]])
+        invalidate_master_cache()
 
-    records = SHEET.get_all_records()
+    records = get_raw_records_cached()
 
-    
     print("DEBUG: raw rows =", len(records))
     print("DEBUG: first row keys =", records[0].keys() if records else "NO ROWS")
 
@@ -480,21 +539,18 @@ def update_master_log():
         print("🚫 Master log rebuild aborted — no parsed data")
         return
 
+    # IMPORTANT: only rebuild if ranks exist; otherwise you'd wipe ranks
     if len(existing_ranks) > 0:
         master.clear()
         master.update(output)
+        invalidate_master_cache()
+        print("✅ Leaf Master Medical Log updated")
     else:
         print("🚫 Aborting master log rebuild — ranks would be lost")
 
 
-    master.clear()
-    master.update(output)
-
-    print("✅ Leaf Master Medical Log updated")
-
 def set_rank_in_master_log(medic_name: str, rank: str) -> str:
-    ss = GC.open_by_key(SPREADSHEET_ID)
-    master = ss.worksheet("Leaf Master Medical Log")
+    master = SS.worksheet("Leaf Master Medical Log")
 
     # Normalize medic name
     name_map = load_medic_normalization()
@@ -505,7 +561,7 @@ def set_rank_in_master_log(medic_name: str, rank: str) -> str:
     if not rank:
         raise ValueError("Invalid rank")
 
-    records = master.get_all_records()
+    records = get_master_records_cached(master)
 
     target_row = None
     for i, row in enumerate(records, start=2):
@@ -520,12 +576,12 @@ def set_rank_in_master_log(medic_name: str, rank: str) -> str:
 
     if target_row is None:
         master.append_row([medic, rank], value_input_option="USER_ENTERED")
+        invalidate_master_cache()
         return f"Added **{medic}** with rank **{rank}**."
     else:
         master.update_cell(target_row, 2, rank)
+        invalidate_master_cache()
         return f"Updated **{medic}** rank to **{rank}**."
-
-
 
 
 # ================= DISCORD BOT =================
@@ -548,10 +604,9 @@ tree = discord.app_commands.CommandTree(bot)
 )
 @discord.app_commands.choices(
     rank=[
-
         discord.app_commands.Choice(name="Field Medic", value="Field Medic"),
         discord.app_commands.Choice(name="Junior Medic", value="Junior Medic"),
-                discord.app_commands.Choice(name="Senior Medic", value="Senior Medic"),
+        discord.app_commands.Choice(name="Senior Medic", value="Senior Medic"),
         discord.app_commands.Choice(name="Paramedic", value="Paramedic"),
         discord.app_commands.Choice(name="Doctor", value="Doctor"),
     ]
@@ -571,9 +626,11 @@ async def setrank(
     try:
         msg = set_rank_in_master_log(medic, rank.value)
 
-        # Recalculate derived data immediately
-        update_master_log()
-        update_leaderboard()
+        # Recalculate derived data immediately (throttled)
+        if should_run("master"):
+            update_master_log()
+        if should_run("leaderboard"):
+            update_leaderboard()
 
         await interaction.followup.send(
             f"✅ {msg}\nBonus applied: **×{bonus_from_rank(rank.value)}**"
@@ -582,14 +639,13 @@ async def setrank(
         await interaction.followup.send(f"⚠️ Error setting rank: {e}")
 
 
-
-
-
 @tree.command(name="updatelogs", description="Force update ALL leaderboard sheets and the master log.")
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
 async def update_logs(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
+        # force fresh cache reads for a manual rebuild
+        get_raw_records_cached(force=True)
         update_master_log()
         update_all_leaderboards()
         await interaction.followup.send("✅ All logs and leaderboards updated!")
@@ -615,6 +671,7 @@ async def rebuild_leaderboard(interaction: discord.Interaction, year: int, month
         return
 
     try:
+        get_raw_records_cached(force=True)
         update_single_leaderboard(year, month)
         month_name = datetime(year, month, 1).strftime("%B")
         await interaction.followup.send(f"✅ Rebuilt leaderboard for **{month_name} {year}**")
@@ -692,8 +749,8 @@ async def medicstats(interaction: discord.Interaction, name: str):
     await interaction.response.defer(ephemeral=False)
 
     try:
-        master = GC.open_by_key(SPREADSHEET_ID).worksheet("Leaf Master Medical Log")
-        records = master.get_all_records()
+        master = SS.worksheet("Leaf Master Medical Log")
+        records = get_master_records_cached(master)
 
         if not records:
             await interaction.followup.send("⚠️ No lifetime data found.")
@@ -702,7 +759,7 @@ async def medicstats(interaction: discord.Interaction, name: str):
         target = None
         for row in records:
             medic_name = row.get("Medic", "")
-            if name.lower() in medic_name.lower():
+            if name.lower() in str(medic_name).lower():
                 target = row
                 break
 
@@ -891,11 +948,17 @@ async def report(interaction: discord.Interaction):
                             value_input_option="USER_ENTERED",
                         )
 
-                        update_master_log()
-                        update_leaderboard()
+                        # New row exists, so cached records are stale
+                        invalidate_raw_cache()
+
+                        # Rebuild derived sheets, but throttle to prevent quota spikes
+                        if should_run("master"):
+                            update_master_log()
+                        if should_run("leaderboard"):
+                            update_leaderboard()
 
                         await modal_interaction.followup.send(
-                            "✅ Report logged and all sheets updated!",
+                            "✅ Report logged and sheets queued for update (throttled).",
                             ephemeral=True,
                         )
 
