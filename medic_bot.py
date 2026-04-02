@@ -827,7 +827,7 @@ async def report(interaction: discord.Interaction):
                 discord.SelectOption(label="World Boss", value="World Boss"),
                 discord.SelectOption(label="Arc", value="Arc"),
                 discord.SelectOption(label="Mission", value="Daily Mission"),
-                discord.SelectOption(label="Hosted Event", value="Hosted Event"),
+                discord.SelectOption(label="Run An Event", value="Hosted Event"),
             ]
             super().__init__(placeholder="Choose Job Type...", options=options)
 
