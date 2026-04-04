@@ -70,7 +70,7 @@ GC = gspread.authorize(CREDS)
 
 # IMPORTANT: open spreadsheet ONCE and reuse it
 SS = GC.open_by_key(SPREADSHEET_ID)
-SHEET = SS.sheet1  # first worksheet with raw logs
+SHEET = SS.worksheet("Reports")  # first worksheet with raw logs
 
 # Expected header row in the first sheet:
 # Timestamp | Medics | Job Name | Duration | Points | Clients | Participant Names | Description | Report Date | Message Link
