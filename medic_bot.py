@@ -26,7 +26,9 @@ VALID_RANKS = [
 ]
 
 # ================= SHEET HEADERS =================
-# Reports sheet should only use columns A:J
+# Reports sheet now uses columns A:N.
+# The last 4 columns let the bot know who submitted each report
+# and which Discord embed should be edited later.
 REPORT_HEADERS = [
     "Timestamp",
     "Medics",
@@ -38,6 +40,10 @@ REPORT_HEADERS = [
     "Description",
     "Report Date",
     "Message Link",
+    "Reporter ID",
+    "Reporter Name",
+    "Message ID",
+    "Channel ID",
 ]
 
 # Master Log should only use columns A:O
@@ -123,8 +129,8 @@ SHEET = SS.worksheet("Reports")  # raw report log worksheet
 
 # ================= SHEET HELPERS =================
 def ensure_reports_sheet_shape():
-    """Keep the Reports sheet locked to the expected A:J structure."""
-    SHEET.update("A1:J1", [REPORT_HEADERS])
+    """Keep the Reports sheet locked to the expected A:N structure."""
+    SHEET.update("A1:N1", [REPORT_HEADERS])
     SHEET.resize(cols=len(REPORT_HEADERS))
 
 
@@ -630,6 +636,107 @@ def set_rank_in_master_log(medic_name: str, rank: str) -> str:
         return f"Updated **{medic}** rank to **{rank}**."
 
 
+
+# ================= REPORT EDIT HELPERS =================
+def split_names(value: str):
+    """Split comma-separated names, also allowing the word 'and'."""
+    return [x.strip() for x in re.split(r",|\band\b", str(value or "")) if x.strip()]
+
+
+def parse_report_duration_to_minutes(duration_value) -> int:
+    """Convert values like '60 min' or '60' into an integer minute count."""
+    text = str(duration_value or "0").strip()
+    match = re.search(r"\d+", text)
+    return int(match.group(0)) if match else 0
+
+
+def parse_clients_count(clients_value) -> int:
+    """Accept either a number or a comma-separated client list."""
+    text = str(clients_value or "").strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        return int(text)
+    return len(split_names(text))
+
+
+def parse_report_date_value(value):
+    """Accept MM/DD/YYYY or YYYY-MM-DD."""
+    text = str(value or "").strip()
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def build_report_embed(
+    job_type: str,
+    desc: str,
+    report_date,
+    medic_list,
+    duration: int,
+    clients_count: int,
+    points: int,
+):
+    """Build the public Discord embed for a submitted or edited report."""
+    embed = discord.Embed(
+        title=f"Medic Report — {job_type}",
+        description=desc,
+        color=0x00FFAA,
+    )
+    embed.add_field(name="Date", value=report_date.strftime("%B %d, %Y"))
+    embed.add_field(name="Medics", value=", ".join(medic_list), inline=False)
+    embed.add_field(name="Duration", value=f"{duration} min")
+    embed.add_field(name="Clients", value=str(clients_count))
+    embed.add_field(name="Points", value=str(points))
+    embed.timestamp = datetime.now()
+    return embed
+
+
+def find_report_row_by_message_id(message_id: str):
+    """
+    Find a report by Discord Message ID.
+    Returns (sheet_row_number, row_dict), or (None, None).
+    """
+    records = get_raw_records_cached(force=True)
+    target = str(message_id).strip()
+
+    for index, row in enumerate(records, start=2):
+        if str(row.get("Message ID", "")).strip() == target:
+            return index, row
+
+    return None, None
+
+
+def get_recent_reports_for_user(user_id: int, limit: int = 10):
+    """Return the user's recent reports, newest first, with sheet row numbers."""
+    records = get_raw_records_cached(force=True)
+    user_id_text = str(user_id)
+    matches = []
+
+    for index, row in enumerate(records, start=2):
+        if str(row.get("Reporter ID", "")).strip() == user_id_text:
+            matches.append((index, row))
+
+    return list(reversed(matches))[:limit]
+
+
+def user_can_edit_report(interaction: discord.Interaction, row: dict) -> bool:
+    """Original reporter or server admin can edit a report."""
+    if interaction.user.guild_permissions.administrator:
+        return True
+    return str(row.get("Reporter ID", "")).strip() == str(interaction.user.id)
+
+
+async def rebuild_after_report_change():
+    """Rebuild derived sheets after a report is added/edited, but respect throttling."""
+    if should_run("master"):
+        update_master_log()
+    if should_run("leaderboard"):
+        update_leaderboard()
+
 # ================= DISCORD BOT =================
 intents = discord.Intents.default()
 intents.message_content = True
@@ -857,6 +964,198 @@ async def medicstats(interaction: discord.Interaction, name: str):
         await interaction.followup.send(f"⚠️ Error: {e}")
 
 
+
+@tree.command(name="myreports", description="Show your recent medic reports that can be edited")
+@discord.app_commands.guilds(discord.Object(id=GUILD_ID))
+async def myreports(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        reports = get_recent_reports_for_user(interaction.user.id, limit=10)
+
+        if not reports:
+            await interaction.followup.send(
+                "I could not find any editable reports for you. Only new reports submitted after this update will show here.",
+                ephemeral=True,
+            )
+            return
+
+        lines = []
+        for sheet_row, row in reports:
+            message_id = str(row.get("Message ID", "")).strip()
+            report_date = str(row.get("Report Date", "")).strip()
+            job_name = str(row.get("Job Name", "")).strip()
+            medics = str(row.get("Medics", "")).strip()
+            points = str(row.get("Points", "")).strip()
+
+            lines.append(
+                f"**Report ID:** `{message_id}`\n"
+                f"• **Date:** {report_date}\n"
+                f"• **Job:** {job_name}\n"
+                f"• **Medics:** {medics}\n"
+                f"• **Points:** {points}\n"
+            )
+
+        await interaction.followup.send(
+            "Use `/editreport report_id:` with one of these Report IDs:\n\n" + "\n".join(lines),
+            ephemeral=True,
+        )
+
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error loading your reports: {e}", ephemeral=True)
+
+
+@tree.command(name="editreport", description="Edit one of your medic reports by Report ID")
+@discord.app_commands.describe(report_id="Use /myreports to find the Report ID")
+@discord.app_commands.guilds(discord.Object(id=GUILD_ID))
+async def editreport(interaction: discord.Interaction, report_id: str):
+    row_number, existing_row = find_report_row_by_message_id(report_id)
+
+    if row_number is None or existing_row is None:
+        await interaction.response.send_message(
+            "❌ I could not find that report. Use `/myreports` to get the correct Report ID.",
+            ephemeral=True,
+        )
+        return
+
+    if not user_can_edit_report(interaction, existing_row):
+        await interaction.response.send_message(
+            "🚫 You can only edit reports you submitted. Admins can edit any report.",
+            ephemeral=True,
+        )
+        return
+
+    class EditReportModal(discord.ui.Modal, title="Edit Medic Report"):
+        medics = discord.ui.TextInput(
+            label="Medic Names (Separate by ,)",
+            default=str(existing_row.get("Medics", ""))[:4000],
+        )
+        report_date = discord.ui.TextInput(
+            label="Report Date (MM/DD/YYYY)",
+            default=str(existing_row.get("Report Date", ""))[:4000],
+        )
+        duration = discord.ui.TextInput(
+            label="Duration in minutes",
+            default=str(parse_report_duration_to_minutes(existing_row.get("Duration", ""))),
+        )
+        clients = discord.ui.TextInput(
+            label="Clients (names or number)",
+            default=str(existing_row.get("Participant Names", "") or existing_row.get("Clients", ""))[:4000],
+        )
+        description = discord.ui.TextInput(
+            label="Description",
+            style=discord.TextStyle.long,
+            default=str(existing_row.get("Description", ""))[:4000],
+        )
+
+        async def on_submit(self, modal_interaction: discord.Interaction):
+            try:
+                await modal_interaction.response.defer(ephemeral=True)
+
+                name_map = load_medic_normalization()
+                medic_list = [
+                    normalize_medic_name(m.strip(), name_map)
+                    for m in split_names(self.medics.value)
+                ]
+
+                if not medic_list:
+                    await modal_interaction.followup.send("⚠️ You need at least one medic name.", ephemeral=True)
+                    return
+
+                date_obj = parse_report_date_value(self.report_date.value)
+                if not date_obj:
+                    await modal_interaction.followup.send(
+                        "⚠️ Invalid date format. Use `MM/DD/YYYY` or `YYYY-MM-DD`.",
+                        ephemeral=True,
+                    )
+                    return
+
+                try:
+                    duration_minutes = int(str(self.duration.value).strip())
+                except ValueError:
+                    await modal_interaction.followup.send("⚠️ Duration must be a number of minutes.", ephemeral=True)
+                    return
+
+                if duration_minutes < 0:
+                    await modal_interaction.followup.send("⚠️ Duration cannot be negative.", ephemeral=True)
+                    return
+
+                clients_text = str(self.clients.value).strip()
+                client_list = split_names(clients_text)
+                clients_count = parse_clients_count(clients_text)
+
+                job_type = str(existing_row.get("Job Name", "")).strip()
+                points = calculate_points(job_type, duration_minutes, clients_count)
+                desc = str(self.description.value).strip()
+
+                old_link = str(existing_row.get("Message Link", "")).strip()
+                old_reporter_id = str(existing_row.get("Reporter ID", "")).strip()
+                old_reporter_name = str(existing_row.get("Reporter Name", "")).strip()
+                old_message_id = str(existing_row.get("Message ID", "")).strip()
+                old_channel_id = str(existing_row.get("Channel ID", "")).strip()
+
+                updated_row = [
+                    str(existing_row.get("Timestamp", "")).strip() or datetime.now().strftime("%m/%d/%Y %H:%M"),
+                    ", ".join(medic_list),
+                    job_type,
+                    f"{duration_minutes} min",
+                    points,
+                    clients_count,
+                    ", ".join(client_list) if client_list else clients_text,
+                    desc,
+                    date_obj.strftime("%m/%d/%Y"),
+                    old_link,
+                    old_reporter_id,
+                    old_reporter_name,
+                    old_message_id,
+                    old_channel_id,
+                ]
+
+                if len(updated_row) != len(REPORT_HEADERS):
+                    raise ValueError(
+                        f"Edited report row has {len(updated_row)} columns, expected {len(REPORT_HEADERS)}"
+                    )
+
+                SHEET.update(
+                    f"A{row_number}:N{row_number}",
+                    [updated_row],
+                    value_input_option="USER_ENTERED",
+                )
+                SHEET.resize(cols=len(REPORT_HEADERS))
+                invalidate_raw_cache()
+
+                # Try to update the original public Discord embed.
+                embed_edit_note = ""
+                try:
+                    channel = bot.get_channel(int(old_channel_id)) or await bot.fetch_channel(int(old_channel_id))
+                    msg = await channel.fetch_message(int(old_message_id))
+                    embed = build_report_embed(
+                        job_type,
+                        desc,
+                        date_obj,
+                        medic_list,
+                        duration_minutes,
+                        clients_count,
+                        points,
+                    )
+                    await msg.edit(embed=embed)
+                except Exception as embed_error:
+                    embed_edit_note = "\n⚠️ Sheet updated, but I could not edit the original Discord embed."
+                    print(f"⚠️ Sheet updated, but could not edit Discord embed: {embed_error}")
+
+                await rebuild_after_report_change()
+
+                await modal_interaction.followup.send(
+                    f"✅ Report `{old_message_id}` updated. New points: **{points}**.{embed_edit_note}",
+                    ephemeral=True,
+                )
+
+            except Exception as e:
+                await modal_interaction.followup.send(f"⚠️ Error editing report: {e}", ephemeral=True)
+
+    await interaction.response.send_modal(EditReportModal())
+
+
 @tree.command(name="report", description="Submit a medic report")
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
 async def report(interaction: discord.Interaction):
@@ -924,14 +1223,12 @@ async def report(interaction: discord.Interaction):
                         name_map = load_medic_normalization()
                         medic_list = [
                             normalize_medic_name(m.strip(), name_map)
-                            for m in re.split(r",|\band\b", self.medics.value)
-                            if m.strip()
+                            for m in split_names(self.medics.value)
                         ]
 
                         clients_list = [
                             p.strip()
-                            for p in re.split(r",|\band\b", self.clients.value)
-                            if p.strip()
+                            for p in split_names(self.clients.value)
                         ]
 
                         date_obj = (
@@ -974,17 +1271,15 @@ async def report(interaction: discord.Interaction):
                         points = calculate_points(job_type, duration, len(clients_list))
                         desc = self.description.value.strip()
 
-                        embed = discord.Embed(
-                            title=f"Medic Report — {job_type}",
-                            description=desc,
-                            color=0x00FFAA,
+                        embed = build_report_embed(
+                            job_type,
+                            desc,
+                            date_obj,
+                            medic_list,
+                            duration,
+                            len(clients_list),
+                            points,
                         )
-                        embed.add_field(name="Date", value=date_obj.strftime("%B %d, %Y"))
-                        embed.add_field(name="Medics", value=", ".join(medic_list), inline=False)
-                        embed.add_field(name="Duration", value=f"{duration} min")
-                        embed.add_field(name="Clients", value=str(len(clients_list)))
-                        embed.add_field(name="Points", value=str(points))
-                        embed.timestamp = datetime.now()
 
                         msg = await modal_interaction.channel.send(embed=embed)
 
@@ -1002,6 +1297,10 @@ async def report(interaction: discord.Interaction):
                             desc,
                             date_obj.strftime("%m/%d/%Y"),
                             hyperlink,
+                            str(modal_interaction.user.id),
+                            str(modal_interaction.user),
+                            str(msg.id),
+                            str(modal_interaction.channel.id),
                         ]
 
                         if len(report_row) != len(REPORT_HEADERS):
@@ -1016,10 +1315,7 @@ async def report(interaction: discord.Interaction):
                         invalidate_raw_cache()
 
                         # Rebuild derived sheets, but throttle to prevent quota spikes
-                        if should_run("master"):
-                            update_master_log()
-                        if should_run("leaderboard"):
-                            update_leaderboard()
+                        await rebuild_after_report_change()
 
                         await modal_interaction.followup.send(
                             "✅ Report logged and sheets queued for update (throttled).",
