@@ -638,13 +638,17 @@ def set_rank_in_master_log(medic_name: str, rank: str) -> str:
 
 
 # ================= REPORT EDIT HELPERS =================
-
 def clean_sheet_id(value) -> str:
     text = str(value or "").strip()
+
+    # Remove leading apostrophe if we added one to force Google Sheets text
     if text.startswith("'"):
         text = text[1:]
+
+    # Remove trailing .0 if Google Sheets gave us a float-looking value
     if text.endswith(".0"):
         text = text[:-2]
+
     return text
 
 def split_names(value: str):
@@ -1098,10 +1102,10 @@ async def editreport(interaction: discord.Interaction, report_id: str):
                 desc = str(self.description.value).strip()
 
                 old_link = str(existing_row.get("Message Link", "")).strip()
-                old_reporter_id = str(existing_row.get("Reporter ID", "")).strip()
+                old_reporter_id = clean_sheet_id(existing_row.get("Reporter ID", "")).strip()
                 old_reporter_name = str(existing_row.get("Reporter Name", "")).strip()
-                old_message_id = str(existing_row.get("Message ID", "")).strip()
-                old_channel_id = str(existing_row.get("Channel ID", "")).strip()
+                old_message_id = clean_sheet_id(existing_row.get("Message ID", "")).strip()
+                old_channel_id = clean_sheet_id(existing_row.get("Channel ID", "")).strip()
 
                 updated_row = [
                     str(existing_row.get("Timestamp", "")).strip() or datetime.now().strftime("%m/%d/%Y %H:%M"),
@@ -1114,10 +1118,10 @@ async def editreport(interaction: discord.Interaction, report_id: str):
                     desc,
                     date_obj.strftime("%m/%d/%Y"),
                     old_link,
-                    old_reporter_id,
+                    f"'{old_reporter_id}",
                     old_reporter_name,
-                    old_message_id,
-                    old_channel_id,
+                    f"'{old_message_id}",
+                    f"'{old_channel_id}",
                 ]
 
                 if len(updated_row) != len(REPORT_HEADERS):
