@@ -74,7 +74,18 @@ SHEET = SS.worksheet("Reports")  # first worksheet with raw logs
 
 # Expected header row in the first sheet:
 # Timestamp | Medics | Job Name | Duration | Points | Clients | Participant Names | Description | Report Date | Message Link
-
+REPORT_HEADERS = [
+    "Timestamp",
+    "Medics",
+    "Job Name",
+    "Duration",
+    "Points",
+    "Clients",
+    "Participant Names",
+    "Description",
+    "Report Date",
+    "Message Link",
+]
 
 # ================= API READ CACHING (QUOTA FIX) =================
 _RAW_CACHE = {"ts": 0.0, "records": []}
@@ -87,13 +98,16 @@ _MASTER_LOCK = threading.Lock()
 
 
 def get_raw_records_cached(force: bool = False):
-    """Return SHEET.get_all_records(), but cache for TTL seconds to avoid quota spikes."""
+    """Return Reports records, but cache for TTL seconds to avoid quota spikes."""
     now = time.time()
     with _RAW_LOCK:
         if (not force) and _RAW_CACHE["records"] and (now - _RAW_CACHE["ts"] < _RAW_CACHE_TTL):
             return _RAW_CACHE["records"]
 
-        records = SHEET.get_all_records()
+        records = SHEET.get_all_records(
+            expected_headers=REPORT_HEADERS
+        )
+
         _RAW_CACHE["records"] = records
         _RAW_CACHE["ts"] = now
         return records
