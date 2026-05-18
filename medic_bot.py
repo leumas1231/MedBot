@@ -25,6 +25,54 @@ VALID_RANKS = [
     "Doctor",
 ]
 
+# ================= SHEET HEADERS =================
+# Reports sheet should only use columns A:J
+REPORT_HEADERS = [
+    "Timestamp",
+    "Medics",
+    "Job Name",
+    "Duration",
+    "Points",
+    "Clients",
+    "Participant Names",
+    "Description",
+    "Report Date",
+    "Message Link",
+]
+
+# Master Log should only use columns A:O
+MASTER_HEADERS = [
+    "Medic",
+    "Rank",
+    "Total Jobs",
+    "Total Raw Points",
+    "Total Adjusted Points",
+    "Total Hours",
+    "Raid",
+    "LMPF",
+    "Healing",
+    "Rev/Spar",
+    "Escort",
+    "World Boss",
+    "Arc",
+    "Mission",
+    "Hosted Event",
+]
+
+# Monthly leaderboard should only use columns A:I
+LEADERBOARD_HEADERS = [
+    "Rank",
+    "Medic",
+    "Raw Points",
+    "Jobs Logged",
+    "Rank Title",
+    "Bonus Multiplier",
+    "Adjusted Points",
+    "Total Pay",
+    "Total Ryo",
+]
+
+
 # ================= RYO (PER-MONTH) =================
 RYO_FILE = "monthly_ryo.json"
 monthly_ryo = {}  # {"2026-01": 25000, ...}
@@ -70,22 +118,23 @@ GC = gspread.authorize(CREDS)
 
 # IMPORTANT: open spreadsheet ONCE and reuse it
 SS = GC.open_by_key(SPREADSHEET_ID)
-SHEET = SS.worksheet("Reports")  # first worksheet with raw logs
+SHEET = SS.worksheet("Reports")  # raw report log worksheet
 
-# Expected header row in the first sheet:
-# Timestamp | Medics | Job Name | Duration | Points | Clients | Participant Names | Description | Report Date | Message Link
-REPORT_HEADERS = [
-    "Timestamp",
-    "Medics",
-    "Job Name",
-    "Duration",
-    "Points",
-    "Clients",
-    "Participant Names",
-    "Description",
-    "Report Date",
-    "Message Link",
-]
+
+# ================= SHEET HELPERS =================
+def ensure_reports_sheet_shape():
+    """Keep the Reports sheet locked to the expected A:J structure."""
+    SHEET.update("A1:J1", [REPORT_HEADERS])
+    SHEET.resize(cols=len(REPORT_HEADERS))
+
+
+def get_records_with_expected_headers(ws, expected_headers):
+    """
+    Read records safely even if Google Sheets visually shows extra empty columns.
+    This prevents gspread duplicate blank header errors like duplicates: [''].
+    """
+    return ws.get_all_records(expected_headers=expected_headers)
+
 
 # ================= API READ CACHING (QUOTA FIX) =================
 _RAW_CACHE = {"ts": 0.0, "records": []}
@@ -104,10 +153,7 @@ def get_raw_records_cached(force: bool = False):
         if (not force) and _RAW_CACHE["records"] and (now - _RAW_CACHE["ts"] < _RAW_CACHE_TTL):
             return _RAW_CACHE["records"]
 
-        records = SHEET.get_all_records(
-            expected_headers=REPORT_HEADERS
-        )
-
+        records = get_records_with_expected_headers(SHEET, REPORT_HEADERS)
         _RAW_CACHE["records"] = records
         _RAW_CACHE["ts"] = now
         return records
@@ -126,7 +172,7 @@ def get_master_records_cached(master_ws, force: bool = False):
         if (not force) and _MASTER_CACHE["records"] and (now - _MASTER_CACHE["ts"] < _MASTER_TTL):
             return _MASTER_CACHE["records"]
 
-        recs = master_ws.get_all_records()
+        recs = get_records_with_expected_headers(master_ws, MASTER_HEADERS)
         _MASTER_CACHE["records"] = recs
         _MASTER_CACHE["ts"] = now
         return recs
@@ -251,12 +297,8 @@ def update_leaderboard():
     try:
         leaderboard_sheet = SS.worksheet(sheet_title)
     except gspread.exceptions.WorksheetNotFound:
-        leaderboard_sheet = SS.add_worksheet(title=sheet_title, rows="200", cols="10")
-        leaderboard_sheet.update([[
-            "Rank", "Medic", "Raw Points", "Jobs Logged",
-            "Rank Title", "Bonus Multiplier",
-            "Adjusted Points", "Total Pay", "Total Ryo"
-        ]])
+        leaderboard_sheet = SS.add_worksheet(title=sheet_title, rows="200", cols=str(len(LEADERBOARD_HEADERS)))
+        leaderboard_sheet.update("A1:I1", [LEADERBOARD_HEADERS])
 
     points_by_medic = defaultdict(int)
     jobs_by_medic = defaultdict(int)
@@ -296,11 +338,7 @@ def update_leaderboard():
     total_adjusted = sum(adjusted_points.values())
     sorted_data = sorted(adjusted_points.items(), key=lambda x: x[1], reverse=True)
 
-    output = [[
-        "Rank", "Medic", "Raw Points", "Jobs Logged",
-        "Rank Title", "Bonus Multiplier",
-        "Adjusted Points", "Total Pay", "Total Ryo"
-    ]]
+    output = [LEADERBOARD_HEADERS]
 
     for i, (medic, adj) in enumerate(sorted_data, start=1):
         raw = points_by_medic[medic]
@@ -319,11 +357,12 @@ def update_leaderboard():
             mult,
             round(adj, 2),
             pay,
-            BANK_RYO if i == 1 else ""
+            BANK_RYO if i == 1 else "",
         ])
 
     leaderboard_sheet.clear()
-    leaderboard_sheet.update(output)
+    leaderboard_sheet.update("A1", output)
+    leaderboard_sheet.resize(cols=len(LEADERBOARD_HEADERS))
 
     print(f"✅ Leaderboard updated for {current_month_name} {current_year} (Pool: {BANK_RYO})")
     return sorted_data, jobs_by_medic
@@ -350,7 +389,7 @@ def update_single_leaderboard(year: int, month: int):
     try:
         leaderboard_sheet = SS.worksheet(sheet_title)
     except gspread.exceptions.WorksheetNotFound:
-        leaderboard_sheet = SS.add_worksheet(sheet_title, rows=200, cols=10)
+        leaderboard_sheet = SS.add_worksheet(sheet_title, rows=200, cols=len(LEADERBOARD_HEADERS))
 
     # Collect raw data for this month
     points_by_medic = defaultdict(int)
@@ -390,11 +429,7 @@ def update_single_leaderboard(year: int, month: int):
 
     total_adj = sum(adjusted.values())
 
-    output = [[
-        "Rank", "Medic", "Raw Points", "Jobs Logged",
-        "Rank Title", "Bonus Multiplier",
-        "Adjusted Points", "Total Pay", "Total Ryo"
-    ]]
+    output = [LEADERBOARD_HEADERS]
 
     sorted_medics = sorted(adjusted.items(), key=lambda x: x[1], reverse=True)
 
@@ -407,13 +442,20 @@ def update_single_leaderboard(year: int, month: int):
         pay = round(share * BANK_RYO, 2)
 
         output.append([
-            i, medic, raw_pts, jobs, rank_title, mult,
-            round(adj_pts, 2), pay,
-            BANK_RYO if i == 1 else ""
+            i,
+            medic,
+            raw_pts,
+            jobs,
+            rank_title,
+            mult,
+            round(adj_pts, 2),
+            pay,
+            BANK_RYO if i == 1 else "",
         ])
 
     leaderboard_sheet.clear()
-    leaderboard_sheet.update(output)
+    leaderboard_sheet.update("A1", output)
+    leaderboard_sheet.resize(cols=len(LEADERBOARD_HEADERS))
 
     print(f"✅ Updated leaderboard: {sheet_title} (Pool: {BANK_RYO})")
 
@@ -457,15 +499,9 @@ def update_master_log():
             normalized = normalize_medic_name(raw_name, name_map)
             existing_ranks[normalized] = row.get("Rank", "Unranked")
     except gspread.exceptions.WorksheetNotFound:
-        master = SS.add_worksheet(title="Leaf Master Medical Log", rows="300", cols="20")
+        master = SS.add_worksheet(title="Leaf Master Medical Log", rows="300", cols=str(len(MASTER_HEADERS)))
         existing_ranks = {}
-        master.update([[
-            "Medic", "Rank", "Total Jobs", "Total Raw Points",
-            "Total Adjusted Points", "Total Hours", "Raid",
-            "LMPF", "Healing", "Rev/Spar",
-            "Escort", "World Boss", "Arc",
-            "Mission", "Hosted Event"
-        ]])
+        master.update("A1:O1", [MASTER_HEADERS])
         invalidate_master_cache()
 
     records = get_raw_records_cached()
@@ -518,13 +554,7 @@ def update_master_log():
             elif "hosted event" in job_name:
                 hours_by_type[medic]["Hosted Event"] += job_hours
 
-    output = [[
-        "Medic", "Rank", "Total Jobs", "Total Raw Points",
-        "Total Adjusted Points", "Total Hours", "Raid",
-        "LMPF", "Healing", "Rev/Spar",
-        "Escort", "World Boss", "Arc",
-        "Mission", "Hosted Event"
-    ]]
+    output = [MASTER_HEADERS]
 
     for medic in sorted(jobs.keys()):
         rank = existing_ranks.get(medic, "Unranked")
@@ -556,7 +586,8 @@ def update_master_log():
     # IMPORTANT: only rebuild if ranks exist; otherwise you'd wipe ranks
     if len(existing_ranks) > 0:
         master.clear()
-        master.update(output)
+        master.update("A1", output)
+        master.resize(cols=len(MASTER_HEADERS))
         invalidate_master_cache()
         print("✅ Leaf Master Medical Log updated")
     else:
@@ -590,6 +621,7 @@ def set_rank_in_master_log(medic_name: str, rank: str) -> str:
 
     if target_row is None:
         master.append_row([medic, rank], value_input_option="USER_ENTERED")
+        master.resize(cols=len(MASTER_HEADERS))
         invalidate_master_cache()
         return f"Added **{medic}** with rank **{rank}**."
     else:
@@ -607,7 +639,6 @@ tree = discord.app_commands.CommandTree(bot)
 
 
 # ================= COMMANDS =================
-
 @tree.command(
     name="setrank",
     description="Set a medic's rank in the Master Medical Log (admin only)"
@@ -909,7 +940,21 @@ async def report(interaction: discord.Interaction):
                             else datetime.now().date()
                         )
 
+                        if not date_obj:
+                            await modal_interaction.followup.send(
+                                "⚠️ Invalid date format. Use `MM/DD/YYYY`, `YYYY-MM-DD`, or leave it blank for today.",
+                                ephemeral=True,
+                            )
+                            return
+
                         t = re.split(r"-|to", self.time_range.value)
+                        if len(t) < 2:
+                            await modal_interaction.followup.send(
+                                "⚠️ Invalid time range. Use something like `5:00 pm - 6:00 pm`.",
+                                ephemeral=True,
+                            )
+                            return
+
                         start = self.parse_time(t[0])
                         end = self.parse_time(t[1])
 
@@ -946,21 +991,26 @@ async def report(interaction: discord.Interaction):
                         link = f"https://discord.com/channels/{modal_interaction.guild.id}/{modal_interaction.channel.id}/{msg.id}"
                         hyperlink = f'=HYPERLINK("{link}", "View Report")'
 
-                        SHEET.append_row(
-                            [
-                                datetime.now().strftime("%m/%d/%Y %H:%M"),
-                                ", ".join(medic_list),
-                                job_type,
-                                f"{duration} min",
-                                points,
-                                len(clients_list),
-                                ", ".join(clients_list),
-                                desc,
-                                date_obj.strftime("%m/%d/%Y"),
-                                hyperlink,
-                            ],
-                            value_input_option="USER_ENTERED",
-                        )
+                        report_row = [
+                            datetime.now().strftime("%m/%d/%Y %H:%M"),
+                            ", ".join(medic_list),
+                            job_type,
+                            f"{duration} min",
+                            points,
+                            len(clients_list),
+                            ", ".join(clients_list),
+                            desc,
+                            date_obj.strftime("%m/%d/%Y"),
+                            hyperlink,
+                        ]
+
+                        if len(report_row) != len(REPORT_HEADERS):
+                            raise ValueError(
+                                f"Report row has {len(report_row)} columns, expected {len(REPORT_HEADERS)}"
+                            )
+
+                        SHEET.append_row(report_row, value_input_option="USER_ENTERED")
+                        SHEET.resize(cols=len(REPORT_HEADERS))
 
                         # New row exists, so cached records are stale
                         invalidate_raw_cache()
@@ -995,6 +1045,11 @@ async def report(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
+    try:
+        ensure_reports_sheet_shape()
+    except Exception as e:
+        print(f"⚠️ Could not lock Reports sheet shape: {e}")
+
     synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
     print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
     print(f"Logged in as {bot.user}")
