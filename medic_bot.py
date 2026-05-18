@@ -1308,7 +1308,11 @@ async def report(interaction: discord.Interaction):
                                 f"Report row has {len(report_row)} columns, expected {len(REPORT_HEADERS)}"
                             )
 
-                        SHEET.append_row(report_row, value_input_option="USER_ENTERED")
+                        SHEET.append_row(
+                            report_row,
+                            value_input_option="USER_ENTERED",
+                            table_range="A1:N1",
+                        )
                         SHEET.resize(cols=len(REPORT_HEADERS))
 
                         # New row exists, so cached records are stale
