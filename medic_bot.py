@@ -638,6 +638,15 @@ def set_rank_in_master_log(medic_name: str, rank: str) -> str:
 
 
 # ================= REPORT EDIT HELPERS =================
+
+def clean_sheet_id(value) -> str:
+    text = str(value or "").strip()
+    if text.startswith("'"):
+        text = text[1:]
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
+
 def split_names(value: str):
     """Split comma-separated names, also allowing the word 'and'."""
     return [x.strip() for x in re.split(r",|\band\b", str(value or "")) if x.strip()]
@@ -704,7 +713,7 @@ def find_report_row_by_message_id(message_id: str):
     target = str(message_id).strip()
 
     for index, row in enumerate(records, start=2):
-        if str(row.get("Message ID", "")).strip() == target:
+        if clean_sheet_id(row.get("Message ID", "")) == target:
             return index, row
 
     return None, None
@@ -717,7 +726,7 @@ def get_recent_reports_for_user(user_id: int, limit: int = 10):
     matches = []
 
     for index, row in enumerate(records, start=2):
-        if str(row.get("Reporter ID", "")).strip() == user_id_text:
+        if clean_sheet_id(row.get("Reporter ID", "")) == user_id_text:
             matches.append((index, row))
 
     return list(reversed(matches))[:limit]
@@ -1297,10 +1306,10 @@ async def report(interaction: discord.Interaction):
                             desc,
                             date_obj.strftime("%m/%d/%Y"),
                             hyperlink,
-                            str(modal_interaction.user.id),
+                            f"'{modal_interaction.user.id}",
                             str(modal_interaction.user),
-                            str(msg.id),
-                            str(modal_interaction.channel.id),
+                            f"'{msg.id}",
+                            f"'{modal_interaction.channel.id}",
                         ]
 
                         if len(report_row) != len(REPORT_HEADERS):
