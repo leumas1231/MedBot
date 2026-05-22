@@ -1051,10 +1051,158 @@ async def editreport(interaction: discord.Interaction, report_id: str):
         )
         return
 
+    current_job = str(existing_row.get("Job Name", "")).strip() or "Raid / Defend"
+
+    async def open_edit_modal(trigger_interaction: discord.Interaction, selected_job_type: str):
+        """Open the edit modal using either the current job or a newly selected job."""
+
+        class EditReportModal(discord.ui.Modal, title="Edit Medic Report"):
+            medics = discord.ui.TextInput(
+                label="Medic Names (Separate by ,)",
+                default=str(existing_row.get("Medics", ""))[:4000],
+            )
+            report_date = discord.ui.TextInput(
+                label="Report Date (MM/DD/YYYY)",
+                default=str(existing_row.get("Report Date", ""))[:4000],
+            )
+            duration = discord.ui.TextInput(
+                label="Duration in minutes",
+                default=str(parse_report_duration_to_minutes(existing_row.get("Duration", ""))),
+            )
+            clients = discord.ui.TextInput(
+                label="Clients (names or number)",
+                default=str(existing_row.get("Participant Names", "") or existing_row.get("Clients", ""))[:4000],
+            )
+            description = discord.ui.TextInput(
+                label="Description",
+                style=discord.TextStyle.long,
+                default=str(existing_row.get("Description", ""))[:4000],
+            )
+
+            async def on_submit(self, modal_interaction: discord.Interaction):
+                try:
+                    await modal_interaction.response.defer(ephemeral=True)
+
+                    name_map = load_medic_normalization()
+                    medic_list = [
+                        normalize_medic_name(m.strip(), name_map)
+                        for m in split_names(self.medics.value)
+                    ]
+
+                    if not medic_list:
+                        await modal_interaction.followup.send(
+                            "⚠️ You need at least one medic name.",
+                            ephemeral=True,
+                        )
+                        return
+
+                    date_obj = parse_report_date_value(self.report_date.value)
+                    if not date_obj:
+                        await modal_interaction.followup.send(
+                            "⚠️ Invalid date format. Use `MM/DD/YYYY` or `YYYY-MM-DD`.",
+                            ephemeral=True,
+                        )
+                        return
+
+                    try:
+                        duration_minutes = int(str(self.duration.value).strip())
+                    except ValueError:
+                        await modal_interaction.followup.send(
+                            "⚠️ Duration must be a number of minutes.",
+                            ephemeral=True,
+                        )
+                        return
+
+                    if duration_minutes < 0:
+                        await modal_interaction.followup.send(
+                            "⚠️ Duration cannot be negative.",
+                            ephemeral=True,
+                        )
+                        return
+
+                    clients_text = str(self.clients.value).strip()
+
+                    if clients_text.isdigit():
+                        clients_count = int(clients_text)
+                        participant_names = clients_text
+                    else:
+                        client_list = split_names(clients_text)
+                        clients_count = len(client_list)
+                        participant_names = ", ".join(client_list)
+
+                    job_type = selected_job_type
+                    points = calculate_points(job_type, duration_minutes, clients_count)
+                    desc = str(self.description.value).strip()
+
+                    old_link = str(existing_row.get("Message Link", "")).strip()
+                    old_reporter_id = clean_sheet_id(existing_row.get("Reporter ID", "")).strip()
+                    old_reporter_name = str(existing_row.get("Reporter Name", "")).strip()
+                    old_message_id = clean_sheet_id(existing_row.get("Message ID", "")).strip()
+                    old_channel_id = clean_sheet_id(existing_row.get("Channel ID", "")).strip()
+
+                    updated_row = [
+                        str(existing_row.get("Timestamp", "")).strip() or datetime.now().strftime("%m/%d/%Y %H:%M"),
+                        ", ".join(medic_list),
+                        job_type,
+                        f"{duration_minutes} min",
+                        points,
+                        clients_count,
+                        participant_names,
+                        desc,
+                        date_obj.strftime("%m/%d/%Y"),
+                        old_link,
+                        f"'{old_reporter_id}",
+                        old_reporter_name,
+                        f"'{old_message_id}",
+                        f"'{old_channel_id}",
+                    ]
+
+                    if len(updated_row) != len(REPORT_HEADERS):
+                        raise ValueError(
+                            f"Edited report row has {len(updated_row)} columns, expected {len(REPORT_HEADERS)}"
+                        )
+
+                    SHEET.update(
+                        f"A{row_number}:N{row_number}",
+                        [updated_row],
+                        value_input_option="USER_ENTERED",
+                    )
+                    SHEET.resize(cols=len(REPORT_HEADERS))
+                    invalidate_raw_cache()
+
+                    # Try to update the original public Discord embed.
+                    embed_edit_note = ""
+                    try:
+                        channel = bot.get_channel(int(old_channel_id)) or await bot.fetch_channel(int(old_channel_id))
+                        msg = await channel.fetch_message(int(old_message_id))
+                        embed = build_report_embed(
+                            job_type,
+                            desc,
+                            date_obj,
+                            medic_list,
+                            duration_minutes,
+                            clients_count,
+                            points,
+                        )
+                        await msg.edit(embed=embed)
+                    except Exception as embed_error:
+                        embed_edit_note = "\n⚠️ Sheet updated, but I could not edit the original Discord embed."
+                        print(f"⚠️ Sheet updated, but could not edit Discord embed: {embed_error}")
+
+                    await rebuild_after_report_change()
+
+                    await modal_interaction.followup.send(
+                        f"✅ Report `{old_message_id}` updated. Job: **{job_type}**. New points: **{points}**.{embed_edit_note}",
+                        ephemeral=True,
+                    )
+
+                except Exception as e:
+                    await modal_interaction.followup.send(f"⚠️ Error editing report: {e}", ephemeral=True)
+
+        await trigger_interaction.response.send_modal(EditReportModal())
+
     class EditJobSelect(discord.ui.Select):
         def __init__(self):
-            current_job = str(existing_row.get("Job Name", "")).strip()
-
             options = [
                 discord.SelectOption(
                     label=label,
@@ -1064,169 +1212,42 @@ async def editreport(interaction: discord.Interaction, report_id: str):
                 for label, value in JOB_OPTIONS
             ]
 
-            # If the current job somehow does not exactly match one of the options,
-            # Discord would have no default selected. That is okay; the user can choose one.
             super().__init__(
-                placeholder="Choose the corrected job type...",
+                placeholder="Optional: choose a different job type...",
                 options=options,
             )
 
         async def callback(self, select_interaction: discord.Interaction):
-            selected_job_type = self.values[0]
-
-            class EditReportModal(discord.ui.Modal, title="Edit Medic Report"):
-                medics = discord.ui.TextInput(
-                    label="Medic Names (Separate by ,)",
-                    default=str(existing_row.get("Medics", ""))[:4000],
+            if select_interaction.user.id != interaction.user.id:
+                await select_interaction.response.send_message(
+                    "🚫 This edit menu is not for you.",
+                    ephemeral=True,
                 )
-                report_date = discord.ui.TextInput(
-                    label="Report Date (MM/DD/YYYY)",
-                    default=str(existing_row.get("Report Date", ""))[:4000],
-                )
-                duration = discord.ui.TextInput(
-                    label="Duration in minutes",
-                    default=str(parse_report_duration_to_minutes(existing_row.get("Duration", ""))),
-                )
-                clients = discord.ui.TextInput(
-                    label="Clients (names or number)",
-                    default=str(existing_row.get("Participant Names", "") or existing_row.get("Clients", ""))[:4000],
-                )
-                description = discord.ui.TextInput(
-                    label="Description",
-                    style=discord.TextStyle.long,
-                    default=str(existing_row.get("Description", ""))[:4000],
-                )
+                return
 
-                async def on_submit(self, modal_interaction: discord.Interaction):
-                    try:
-                        await modal_interaction.response.defer(ephemeral=True)
+            await open_edit_modal(select_interaction, self.values[0])
 
-                        name_map = load_medic_normalization()
-                        medic_list = [
-                            normalize_medic_name(m.strip(), name_map)
-                            for m in split_names(self.medics.value)
-                        ]
-
-                        if not medic_list:
-                            await modal_interaction.followup.send(
-                                "⚠️ You need at least one medic name.",
-                                ephemeral=True,
-                            )
-                            return
-
-                        date_obj = parse_report_date_value(self.report_date.value)
-                        if not date_obj:
-                            await modal_interaction.followup.send(
-                                "⚠️ Invalid date format. Use `MM/DD/YYYY` or `YYYY-MM-DD`.",
-                                ephemeral=True,
-                            )
-                            return
-
-                        try:
-                            duration_minutes = int(str(self.duration.value).strip())
-                        except ValueError:
-                            await modal_interaction.followup.send(
-                                "⚠️ Duration must be a number of minutes.",
-                                ephemeral=True,
-                            )
-                            return
-
-                        if duration_minutes < 0:
-                            await modal_interaction.followup.send(
-                                "⚠️ Duration cannot be negative.",
-                                ephemeral=True,
-                            )
-                            return
-
-                        clients_text = str(self.clients.value).strip()
-
-                        if clients_text.isdigit():
-                            clients_count = int(clients_text)
-                            participant_names = clients_text
-                        else:
-                            client_list = split_names(clients_text)
-                            clients_count = len(client_list)
-                            participant_names = ", ".join(client_list)
-
-                        job_type = selected_job_type
-                        points = calculate_points(job_type, duration_minutes, clients_count)
-                        desc = str(self.description.value).strip()
-
-                        old_link = str(existing_row.get("Message Link", "")).strip()
-                        old_reporter_id = clean_sheet_id(existing_row.get("Reporter ID", "")).strip()
-                        old_reporter_name = str(existing_row.get("Reporter Name", "")).strip()
-                        old_message_id = clean_sheet_id(existing_row.get("Message ID", "")).strip()
-                        old_channel_id = clean_sheet_id(existing_row.get("Channel ID", "")).strip()
-
-                        updated_row = [
-                            str(existing_row.get("Timestamp", "")).strip() or datetime.now().strftime("%m/%d/%Y %H:%M"),
-                            ", ".join(medic_list),
-                            job_type,
-                            f"{duration_minutes} min",
-                            points,
-                            clients_count,
-                            participant_names,
-                            desc,
-                            date_obj.strftime("%m/%d/%Y"),
-                            old_link,
-                            f"'{old_reporter_id}",
-                            old_reporter_name,
-                            f"'{old_message_id}",
-                            f"'{old_channel_id}",
-                        ]
-
-                        if len(updated_row) != len(REPORT_HEADERS):
-                            raise ValueError(
-                                f"Edited report row has {len(updated_row)} columns, expected {len(REPORT_HEADERS)}"
-                            )
-
-                        SHEET.update(
-                            f"A{row_number}:N{row_number}",
-                            [updated_row],
-                            value_input_option="USER_ENTERED",
-                        )
-                        SHEET.resize(cols=len(REPORT_HEADERS))
-                        invalidate_raw_cache()
-
-                        # Try to update the original public Discord embed.
-                        embed_edit_note = ""
-                        try:
-                            channel = bot.get_channel(int(old_channel_id)) or await bot.fetch_channel(int(old_channel_id))
-                            msg = await channel.fetch_message(int(old_message_id))
-                            embed = build_report_embed(
-                                job_type,
-                                desc,
-                                date_obj,
-                                medic_list,
-                                duration_minutes,
-                                clients_count,
-                                points,
-                            )
-                            await msg.edit(embed=embed)
-                        except Exception as embed_error:
-                            embed_edit_note = "\n⚠️ Sheet updated, but I could not edit the original Discord embed."
-                            print(f"⚠️ Sheet updated, but could not edit Discord embed: {embed_error}")
-
-                        await rebuild_after_report_change()
-
-                        await modal_interaction.followup.send(
-                            f"✅ Report `{old_message_id}` updated. New job: **{job_type}**. New points: **{points}**.{embed_edit_note}",
-                            ephemeral=True,
-                        )
-
-                    except Exception as e:
-                        await modal_interaction.followup.send(f"⚠️ Error editing report: {e}", ephemeral=True)
-
-            await select_interaction.response.send_modal(EditReportModal())
-
-    class EditJobSelectView(discord.ui.View):
+    class EditReportView(discord.ui.View):
         def __init__(self):
-            super().__init__(timeout=60)
+            super().__init__(timeout=120)
             self.add_item(EditJobSelect())
 
+        @discord.ui.button(label="Keep current job and edit details", style=discord.ButtonStyle.primary)
+        async def keep_current_job(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+            if button_interaction.user.id != interaction.user.id:
+                await button_interaction.response.send_message(
+                    "🚫 This edit menu is not for you.",
+                    ephemeral=True,
+                )
+                return
+
+            await open_edit_modal(button_interaction, current_job)
+
     await interaction.response.send_message(
-        "Choose the corrected **Job Type** for this report:",
-        view=EditJobSelectView(),
+        f"Current job type: **{current_job}**\n\n"
+        "Click **Keep current job and edit details** to edit minutes/clients/etc. without changing the job.\n"
+        "Or use the dropdown only if you need to change the job type.",
+        view=EditReportView(),
         ephemeral=True,
     )
 
