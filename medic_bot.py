@@ -46,7 +46,7 @@ REPORT_HEADERS = [
     "Channel ID",
 ]
 
-# Master Log should only use columns A:O
+# Master Log should only use columns A:Q
 MASTER_HEADERS = [
     "Medic",
     "Rank",
@@ -63,6 +63,8 @@ MASTER_HEADERS = [
     "Arc",
     "Mission",
     "Hosted Event",
+    "Host Training Event",
+    "Participate In Training Event",
 ]
 
 # Monthly leaderboard should only use columns A:I
@@ -86,9 +88,13 @@ JOB_OPTIONS = [
     ("Rev Spar", "Rev Spar"),
     ("Escort", "Escort"),
     ("World Boss", "World Boss"),
-    ("Arc", "Arc"),
+    ("ARC I (15, 20, 27, 30)", "ARC I"),
+    ("ARC II (30, 40, 50)", "ARC II"),
+    ("ARC III (60)", "ARC III"),
     ("Mission", "Daily Mission"),
     ("Run An Event", "Hosted Event"),
+    ("Host Training Event", "Host Training Event"),
+    ("Participate In Training Event", "Participate In Training Event"),
 ]
 
 
@@ -145,6 +151,16 @@ def ensure_reports_sheet_shape():
     """Keep the Reports sheet locked to the expected A:N structure."""
     SHEET.update("A1:N1", [REPORT_HEADERS])
     SHEET.resize(cols=len(REPORT_HEADERS))
+
+
+def ensure_master_sheet_shape():
+    """Add/refresh Master Log headers without deleting existing medic data or ranks."""
+    try:
+        master = SS.worksheet("Leaf Master Medical Log")
+        master.resize(cols=len(MASTER_HEADERS))
+        master.update("A1:Q1", [MASTER_HEADERS])
+    except gspread.exceptions.WorksheetNotFound:
+        pass
 
 
 def get_records_with_expected_headers(ws, expected_headers):
@@ -246,6 +262,12 @@ def normalize_medic_name(name: str, mapping: dict) -> str:
 def calculate_points(job_name: str, duration: int, clients: int) -> int:
     job_name = job_name.lower().strip()
 
+    # Training events — fixed points
+    if "host training event" in job_name:
+        return 35
+    if "participate in training event" in job_name:
+        return 20
+
     # Hosted Event — 30 points, must be at least 60 min and 5+ clients
     if "hosted event" in job_name:
         if duration >= 60 and clients >= 5:
@@ -253,7 +275,7 @@ def calculate_points(job_name: str, duration: int, clients: int) -> int:
         return 0
 
     if "raid" in job_name or "defend" in job_name:
-        return 3 + 2 * (duration // 15)
+        return 5 + 4 * (duration // 15)
     if "criminal" in job_name or "lmpf" in job_name:
         return 3
     if "healing" in job_name or "lowbie" in job_name or "farm" in job_name:
@@ -264,8 +286,19 @@ def calculate_points(job_name: str, duration: int, clients: int) -> int:
         return 2
     if "boss" in job_name or "world" in job_name:
         return clients * 3
-    if "arc" in job_name:
+
+    # Categorized arcs — points are awarded per client
+    if job_name == "arc i":
+        return clients * 10
+    if job_name == "arc ii":
+        return clients * 20
+    if job_name == "arc iii":
         return clients * 30
+
+    # Legacy Arc reports keep the old behavior if an older report is edited.
+    if job_name == "arc":
+        return clients * 30
+
     if "mission" in job_name or "daily" in job_name:
         return clients * 3
 
@@ -520,7 +553,7 @@ def update_master_log():
     except gspread.exceptions.WorksheetNotFound:
         master = SS.add_worksheet(title="Leaf Master Medical Log", rows="300", cols=str(len(MASTER_HEADERS)))
         existing_ranks = {}
-        master.update("A1:O1", [MASTER_HEADERS])
+        master.update("A1:Q1", [MASTER_HEADERS])
         invalidate_master_cache()
 
     records = get_raw_records_cached()
@@ -572,6 +605,10 @@ def update_master_log():
                 hours_by_type[medic]["Mission"] += job_hours
             elif "hosted event" in job_name:
                 hours_by_type[medic]["Hosted Event"] += job_hours
+            elif "host training event" in job_name:
+                hours_by_type[medic]["Host Training Event"] += job_hours
+            elif "participate in training event" in job_name:
+                hours_by_type[medic]["Participate In Training Event"] += job_hours
 
     output = [MASTER_HEADERS]
 
@@ -596,6 +633,8 @@ def update_master_log():
             round(hours_by_type[medic]["Arc"], 2),
             round(hours_by_type[medic]["Mission"], 2),
             round(hours_by_type[medic]["Hosted Event"], 2),
+            round(hours_by_type[medic]["Host Training Event"], 2),
+            round(hours_by_type[medic]["Participate In Training Event"], 2),
         ])
 
     if len(output) <= 1:
@@ -961,6 +1000,8 @@ async def medicstats(interaction: discord.Interaction, name: str):
         arc_h = target.get("Arc", 0)
         mission_h = target.get("Mission", 0)
         event_h = target.get("Hosted Event", 0)
+        host_training_h = target.get("Host Training Event", 0)
+        participate_training_h = target.get("Participate In Training Event", 0)
 
         embed = discord.Embed(title=f"💠 Lifetime Stats — {medic}", color=0x3498DB)
         embed.add_field(name="Rank", value=rank, inline=True)
@@ -979,7 +1020,9 @@ async def medicstats(interaction: discord.Interaction, name: str):
                 f"• **World Boss:** {boss_h}\n"
                 f"• **Arc:** {arc_h}\n"
                 f"• **Mission:** {mission_h}\n"
-                f"• **Hosted Event:** {event_h}"
+                f"• **Hosted Event:** {event_h}\n"
+                f"• **Host Training Event:** {host_training_h}\n"
+                f"• **Participate In Training Event:** {participate_training_h}"
             ),
             inline=False,
         )
@@ -1436,8 +1479,9 @@ async def report(interaction: discord.Interaction):
 async def on_ready():
     try:
         ensure_reports_sheet_shape()
+        ensure_master_sheet_shape()
     except Exception as e:
-        print(f"⚠️ Could not lock Reports sheet shape: {e}")
+        print(f"⚠️ Could not lock sheet shapes: {e}")
 
     synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
     print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
