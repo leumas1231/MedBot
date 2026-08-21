@@ -5,6 +5,9 @@ import os
 import json
 import time
 import threading
+import asyncio
+import urllib.request
+import urllib.error
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
@@ -17,7 +20,14 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = 1439473833273856120  # text channel if needed
 SPREADSHEET_ID = "1aXhvKbXqXlHEu94dQctSJP8jk6tLvNWkrYHZyDYcI0c"
 GUILD_ID = 861362652710174740  # your real server (guild) ID
+
+# Optional WordPress push sync. Leave blank until LVMC Core v0.3+ is configured.
+WORDPRESS_SYNC_URL = os.getenv("LVMC_WORDPRESS_SYNC_URL", "").strip()
+WORDPRESS_SYNC_SECRET = os.getenv("LVMC_WORDPRESS_SYNC_SECRET", "").strip()
+
 VALID_RANKS = [
+    # Intern Medic is stored as "Unranked" in the medical spreadsheet.
+    "Unranked",
     "Field Medic",
     "Junior Medic",
     "Senior Medic",
@@ -26,9 +36,9 @@ VALID_RANKS = [
 ]
 
 # ================= SHEET HEADERS =================
-# Reports sheet now uses columns A:N.
-# The last 4 columns let the bot know who submitted each report
-# and which Discord embed should be edited later.
+# Reports sheet uses columns A:O.
+# Column O stores the Discord IDs for the medics listed in column B, in the
+# same order. Existing A:N report data remains in the same columns.
 REPORT_HEADERS = [
     "Timestamp",
     "Medics",
@@ -44,9 +54,11 @@ REPORT_HEADERS = [
     "Reporter Name",
     "Message ID",
     "Channel ID",
+    "Medic Discord IDs",
 ]
 
-# Master Log should only use columns A:Q
+# Master Log keeps the existing A:Q columns and appends identity/promotion
+# counters in R:W so old formulas/data are not shifted.
 MASTER_HEADERS = [
     "Medic",
     "Rank",
@@ -65,6 +77,12 @@ MASTER_HEADERS = [
     "Hosted Event",
     "Host Training Event",
     "Participate In Training Event",
+    "Discord ID",
+    "Total Clients",
+    "Raid/Defense Count",
+    "Hosted Event Count",
+    "Host Training Count",
+    "Training Participation Count",
 ]
 
 # Monthly leaderboard should only use columns A:I
@@ -148,8 +166,8 @@ SHEET = SS.worksheet("Reports")  # raw report log worksheet
 
 # ================= SHEET HELPERS =================
 def ensure_reports_sheet_shape():
-    """Keep the Reports sheet locked to the expected A:N structure."""
-    SHEET.update("A1:N1", [REPORT_HEADERS])
+    """Keep the Reports sheet locked to the expected A:O structure."""
+    SHEET.update("A1:O1", [REPORT_HEADERS])
     SHEET.resize(cols=len(REPORT_HEADERS))
 
 
@@ -158,7 +176,7 @@ def ensure_master_sheet_shape():
     try:
         master = SS.worksheet("Leaf Master Medical Log")
         master.resize(cols=len(MASTER_HEADERS))
-        master.update("A1:Q1", [MASTER_HEADERS])
+        master.update("A1:W1", [MASTER_HEADERS])
     except gspread.exceptions.WorksheetNotFound:
         pass
 
@@ -258,6 +276,77 @@ def normalize_medic_name(name: str, mapping: dict) -> str:
     return proper
 
 
+def clean_sheet_id(value) -> str:
+    """Normalize Discord/snowflake IDs read back from Google Sheets."""
+    text = str(value or "").strip()
+    if text.startswith("'"):
+        text = text[1:]
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
+
+
+def split_names(value: str):
+    """Split comma-separated names, also allowing the word 'and'."""
+    return [x.strip() for x in re.split(r",|\band\b", str(value or "")) if x.strip()]
+
+
+def report_medic_pairs(row: dict):
+    """Return [(display_name, discord_id), ...] for a Reports row.
+
+    Old reports have no Medic Discord IDs, so their IDs are returned as blank.
+    New reports keep the names and IDs positionally aligned.
+    """
+    names = split_names(row.get("Medics", ""))
+    raw_ids = str(row.get("Medic Discord IDs", "") or "")
+    ids = [clean_sheet_id(x) for x in raw_ids.split(",")] if raw_ids else []
+    return [(name, ids[i] if i < len(ids) else "") for i, name in enumerate(names)]
+
+
+def serialize_medic_discord_ids(discord_ids) -> str:
+    """Store multiple Discord IDs in one Sheets cell without numeric precision loss."""
+    joined = ", ".join(str(x).strip() for x in discord_ids if str(x).strip())
+    return f"'{joined}" if joined else ""
+
+
+def build_known_discord_ids(master_records=None, raw_records=None):
+    """Build a best-known name -> Discord ID map from Master Log and Reports."""
+    mapping = {}
+
+    for row in master_records or []:
+        name = str(row.get("Medic", "") or "").strip()
+        did = clean_sheet_id(row.get("Discord ID", ""))
+        if name and did:
+            mapping[name.lower()] = did
+
+    for row in raw_records or []:
+        for name, did in report_medic_pairs(row):
+            if name and did:
+                mapping[name.lower()] = did
+
+    return mapping
+
+
+def medic_identity_key(name: str, discord_id: str = "", known_ids=None) -> str:
+    """Prefer Discord ID as the stable identity; fall back to normalized name."""
+    did = clean_sheet_id(discord_id)
+    if not did and known_ids:
+        did = clean_sheet_id(known_ids.get(str(name).lower(), ""))
+    if did:
+        return f"id:{did}"
+    return f"name:{str(name).strip().lower()}"
+
+
+def member_display_name(member) -> str:
+    """Return the best server-facing display name for a Discord user/member."""
+    return (
+        getattr(member, "display_name", None)
+        or getattr(member, "global_name", None)
+        or getattr(member, "name", None)
+        or str(member)
+    )
+
+
 # ================= POINT CALCULATOR =================
 def calculate_points(job_name: str, duration: int, clients: int) -> int:
     job_name = job_name.lower().strip()
@@ -323,6 +412,62 @@ def bonus_from_rank(rank: str) -> float:
 
 
 # ================= MONTHLY LEADERBOARD =================
+def _load_rank_identity_maps(records):
+    """Return rank/display-name maps keyed by stable medic identity."""
+    rank_by_identity = {}
+    display_by_identity = {}
+    master_records = []
+
+    try:
+        master = SS.worksheet("Leaf Master Medical Log")
+        master_records = get_master_records_cached(master)
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+
+    known_ids = build_known_discord_ids(master_records, records)
+    for row in master_records:
+        name = str(row.get("Medic", "") or "").strip()
+        if not name:
+            continue
+        key = medic_identity_key(name, row.get("Discord ID", ""), known_ids)
+        rank_by_identity[key] = row.get("Rank", "Unranked") or "Unranked"
+        display_by_identity[key] = name
+
+    return rank_by_identity, display_by_identity, known_ids
+
+
+def _collect_monthly_stats(records, year: int, month: int, known_ids):
+    points_by_identity = defaultdict(int)
+    jobs_by_identity = defaultdict(int)
+    display_by_identity = {}
+
+    for row in records:
+        date_str = str(row.get("Report Date", "")).strip()
+        if not date_str:
+            continue
+
+        try:
+            d = datetime.strptime(date_str, "%m/%d/%Y")
+        except ValueError:
+            continue
+
+        if d.year != year or d.month != month:
+            continue
+
+        try:
+            points = int(row.get("Points", 0))
+        except (ValueError, TypeError):
+            points = 0
+
+        for medic_name, discord_id in report_medic_pairs(row):
+            key = medic_identity_key(medic_name, discord_id, known_ids)
+            points_by_identity[key] += points
+            jobs_by_identity[key] += 1
+            display_by_identity[key] = medic_name
+
+    return points_by_identity, jobs_by_identity, display_by_identity
+
+
 def update_leaderboard():
     records = get_raw_records_cached()
     now = datetime.now()
@@ -333,182 +478,109 @@ def update_leaderboard():
     sheet_title = f"Leaderboard - {current_month_name} {current_year}"
     BANK_RYO = get_bank_ryo(current_year, current_month)
 
-    # Load ranks from Master Log (if exists)
-    rank_by_medic = {}
-    try:
-        master = SS.worksheet("Leaf Master Medical Log")
-        master_records = get_master_records_cached(master)
-        for row in master_records:
-            medic_name = row.get("Medic", "").strip()
-            if medic_name:
-                rank_by_medic[medic_name] = row.get("Rank", "Unranked")
-    except gspread.exceptions.WorksheetNotFound:
-        rank_by_medic = {}
+    rank_by_identity, master_display, known_ids = _load_rank_identity_maps(records)
 
-    # Create or open the monthly leaderboard sheet
     try:
         leaderboard_sheet = SS.worksheet(sheet_title)
     except gspread.exceptions.WorksheetNotFound:
-        leaderboard_sheet = SS.add_worksheet(title=sheet_title, rows="200", cols=str(len(LEADERBOARD_HEADERS)))
+        leaderboard_sheet = SS.add_worksheet(
+            title=sheet_title, rows="200", cols=str(len(LEADERBOARD_HEADERS))
+        )
         leaderboard_sheet.update("A1:I1", [LEADERBOARD_HEADERS])
 
-    points_by_medic = defaultdict(int)
-    jobs_by_medic = defaultdict(int)
+    points_by_identity, jobs_by_identity, report_display = _collect_monthly_stats(
+        records, current_year, current_month, known_ids
+    )
 
-    for row in records:
-        date_str = str(row.get("Report Date", "")).strip()
-        if not date_str:
-            continue
-
-        try:
-            d = datetime.strptime(date_str, "%m/%d/%Y")
-        except ValueError:
-            continue
-
-        if d.month == current_month and d.year == current_year:
-            medics_raw = row.get("Medics", "")
-            try:
-                points = int(row.get("Points", 0))
-            except ValueError:
-                points = 0
-
-            for medic in [m.strip() for m in medics_raw.split(",") if m.strip()]:
-                points_by_medic[medic] += points
-                jobs_by_medic[medic] += 1
-
-    # IMPORTANT: Never clear/overwrite a leaderboard if there is no data
-    if not points_by_medic:
+    if not points_by_identity:
         print("⚠️ No data for current month — leaderboard left unchanged")
         return [], {}
 
     adjusted_points = {}
-    for medic, raw in points_by_medic.items():
-        rank = rank_by_medic.get(medic, "Unranked")
-        mult = bonus_from_rank(rank)
-        adjusted_points[medic] = raw * mult
+    for key, raw in points_by_identity.items():
+        rank = rank_by_identity.get(key, "Unranked")
+        adjusted_points[key] = raw * bonus_from_rank(rank)
 
     total_adjusted = sum(adjusted_points.values())
-    sorted_data = sorted(adjusted_points.items(), key=lambda x: x[1], reverse=True)
-
+    sorted_keys = sorted(adjusted_points, key=adjusted_points.get, reverse=True)
     output = [LEADERBOARD_HEADERS]
+    return_data = []
+    return_jobs = {}
 
-    for i, (medic, adj) in enumerate(sorted_data, start=1):
-        raw = points_by_medic[medic]
-        jobs = jobs_by_medic[medic]
-        rank_title = rank_by_medic.get(medic, "Unranked")
+    for i, key in enumerate(sorted_keys, start=1):
+        medic = report_display.get(key) or master_display.get(key) or key
+        raw = points_by_identity[key]
+        jobs = jobs_by_identity[key]
+        rank_title = rank_by_identity.get(key, "Unranked")
         mult = bonus_from_rank(rank_title)
+        adj = adjusted_points[key]
         share = adj / total_adjusted if total_adjusted > 0 else 0
         pay = round(share * BANK_RYO, 2)
 
         output.append([
-            i,
-            medic,
-            raw,
-            jobs,
-            rank_title,
-            mult,
-            round(adj, 2),
-            pay,
+            i, medic, raw, jobs, rank_title, mult, round(adj, 2), pay,
             BANK_RYO if i == 1 else "",
         ])
+        return_data.append((medic, adj))
+        return_jobs[medic] = jobs
 
     leaderboard_sheet.clear()
     leaderboard_sheet.update("A1", output)
     leaderboard_sheet.resize(cols=len(LEADERBOARD_HEADERS))
 
     print(f"✅ Leaderboard updated for {current_month_name} {current_year} (Pool: {BANK_RYO})")
-    return sorted_data, jobs_by_medic
+    return return_data, return_jobs
 
 
 def update_single_leaderboard(year: int, month: int):
     records = get_raw_records_cached()
     BANK_RYO = get_bank_ryo(year, month)
-
     sheet_title = f"Leaderboard - {datetime(year, month, 1).strftime('%b')} {year}"
 
-    # Load ranks
-    try:
-        master = SS.worksheet("Leaf Master Medical Log")
-        master_records = get_master_records_cached(master)
-        rank_by_medic = {
-            row.get("Medic", ""): row.get("Rank", "Unranked")
-            for row in master_records
-        }
-    except gspread.exceptions.WorksheetNotFound:
-        rank_by_medic = {}
+    rank_by_identity, master_display, known_ids = _load_rank_identity_maps(records)
 
-    # Create or open the sheet
     try:
         leaderboard_sheet = SS.worksheet(sheet_title)
     except gspread.exceptions.WorksheetNotFound:
-        leaderboard_sheet = SS.add_worksheet(sheet_title, rows=200, cols=len(LEADERBOARD_HEADERS))
+        leaderboard_sheet = SS.add_worksheet(
+            sheet_title, rows=200, cols=len(LEADERBOARD_HEADERS)
+        )
 
-    # Collect raw data for this month
-    points_by_medic = defaultdict(int)
-    jobs_by_medic = defaultdict(int)
+    points_by_identity, jobs_by_identity, report_display = _collect_monthly_stats(
+        records, year, month, known_ids
+    )
 
-    for row in records:
-        date_str = str(row.get("Report Date", "")).strip()
-        if not date_str:
-            continue
-
-        try:
-            d = datetime.strptime(date_str, "%m/%d/%Y")
-        except ValueError:
-            continue
-
-        if d.year == year and d.month == month:
-            medics = [m.strip() for m in row.get("Medics", "").split(",") if m.strip()]
-            try:
-                pts = int(row.get("Points", 0))
-            except ValueError:
-                pts = 0
-
-            for medic in medics:
-                points_by_medic[medic] += pts
-                jobs_by_medic[medic] += 1
-
-    # IMPORTANT: do NOT clear/overwrite if empty
-    if not points_by_medic:
+    if not points_by_identity:
         print(f"⚠️ No data for {sheet_title} — skipping update")
         return
 
     adjusted = {}
-    for medic, raw_pts in points_by_medic.items():
-        rank = rank_by_medic.get(medic, "Unranked")
-        mult = bonus_from_rank(rank)
-        adjusted[medic] = raw_pts * mult
+    for key, raw_pts in points_by_identity.items():
+        rank = rank_by_identity.get(key, "Unranked")
+        adjusted[key] = raw_pts * bonus_from_rank(rank)
 
     total_adj = sum(adjusted.values())
-
     output = [LEADERBOARD_HEADERS]
+    sorted_keys = sorted(adjusted, key=adjusted.get, reverse=True)
 
-    sorted_medics = sorted(adjusted.items(), key=lambda x: x[1], reverse=True)
-
-    for i, (medic, adj_pts) in enumerate(sorted_medics, start=1):
-        raw_pts = points_by_medic[medic]
-        jobs = jobs_by_medic[medic]
-        rank_title = rank_by_medic.get(medic, "Unranked")
+    for i, key in enumerate(sorted_keys, start=1):
+        medic = report_display.get(key) or master_display.get(key) or key
+        raw_pts = points_by_identity[key]
+        jobs = jobs_by_identity[key]
+        rank_title = rank_by_identity.get(key, "Unranked")
         mult = bonus_from_rank(rank_title)
+        adj_pts = adjusted[key]
         share = adj_pts / total_adj if total_adj else 0
         pay = round(share * BANK_RYO, 2)
 
         output.append([
-            i,
-            medic,
-            raw_pts,
-            jobs,
-            rank_title,
-            mult,
-            round(adj_pts, 2),
-            pay,
+            i, medic, raw_pts, jobs, rank_title, mult, round(adj_pts, 2), pay,
             BANK_RYO if i == 1 else "",
         ])
 
     leaderboard_sheet.clear()
     leaderboard_sheet.update("A1", output)
     leaderboard_sheet.resize(cols=len(LEADERBOARD_HEADERS))
-
     print(f"✅ Updated leaderboard: {sheet_title} (Pool: {BANK_RYO})")
 
 
@@ -535,28 +607,36 @@ def update_all_leaderboards():
 
 # ================= MASTER LOG (LIFETIME) =================
 def update_master_log():
-    # Ensure master sheet exists & capture existing ranks
+    """Rebuild lifetime stats, preferring Discord ID as each medic's identity."""
+    master_was_created = False
+
     try:
         master = SS.worksheet("Leaf Master Medical Log")
         existing_records = get_master_records_cached(master)
-        existing_ranks = {}
-
-        name_map = load_medic_normalization()
-
-        for row in existing_records:
-            raw_name = row.get("Medic", "").strip()
-            if not raw_name:
-                continue
-
-            normalized = normalize_medic_name(raw_name, name_map)
-            existing_ranks[normalized] = row.get("Rank", "Unranked")
     except gspread.exceptions.WorksheetNotFound:
-        master = SS.add_worksheet(title="Leaf Master Medical Log", rows="300", cols=str(len(MASTER_HEADERS)))
-        existing_ranks = {}
-        master.update("A1:Q1", [MASTER_HEADERS])
+        master = SS.add_worksheet(
+            title="Leaf Master Medical Log", rows="300", cols=str(len(MASTER_HEADERS))
+        )
+        master.update("A1:W1", [MASTER_HEADERS])
         invalidate_master_cache()
+        existing_records = []
+        master_was_created = True
 
     records = get_raw_records_cached()
+    name_map = load_medic_normalization()
+    known_ids = build_known_discord_ids(existing_records, records)
+
+    # Preserve manually-set ranks, but key them by Discord ID whenever one is known.
+    existing_ranks = {}
+    existing_display = {}
+    for row in existing_records:
+        raw_name = str(row.get("Medic", "") or "").strip()
+        if not raw_name:
+            continue
+        normalized = normalize_medic_name(raw_name, name_map)
+        key = medic_identity_key(normalized, row.get("Discord ID", ""), known_ids)
+        existing_ranks[key] = row.get("Rank", "Unranked") or "Unranked"
+        existing_display[key] = normalized
 
     print("DEBUG: raw rows =", len(records))
     print("DEBUG: first row keys =", records[0].keys() if records else "NO ROWS")
@@ -565,13 +645,16 @@ def update_master_log():
     jobs = defaultdict(int)
     hours = defaultdict(float)
     hours_by_type = defaultdict(lambda: defaultdict(float))
+    counts_by_type = defaultdict(lambda: defaultdict(int))
+    total_clients = defaultdict(int)
+    display_names = dict(existing_display)
+    discord_ids = {}
 
     for row in records:
-        medics_raw = row.get("Medics", "")
         job_name = str(row.get("Job Name", "")).lower()
         try:
             points = int(row.get("Points", 0))
-        except ValueError:
+        except (ValueError, TypeError):
             points = 0
 
         duration_str = str(row.get("Duration", "0 min"))
@@ -580,76 +663,102 @@ def update_master_log():
         except (ValueError, IndexError):
             minutes = 0
         job_hours = minutes / 60.0
+        try:
+            clients_for_job = int(row.get("Clients", 0) or 0)
+        except (ValueError, TypeError):
+            clients_for_job = parse_clients_count(row.get("Participant Names", ""))
 
-        medics = [m.strip() for m in medics_raw.split(",") if m.strip()]
-        for medic in medics:
-            raw_points[medic] += points
-            jobs[medic] += 1
-            hours[medic] += job_hours
+        for medic_name, row_discord_id in report_medic_pairs(row):
+            normalized = normalize_medic_name(medic_name, name_map)
+            key = medic_identity_key(normalized, row_discord_id, known_ids)
+            did = clean_sheet_id(row_discord_id) or clean_sheet_id(known_ids.get(normalized.lower(), ""))
+
+            raw_points[key] += points
+            jobs[key] += 1
+            hours[key] += job_hours
+            total_clients[key] += clients_for_job
+            display_names[key] = normalized
+            if did:
+                discord_ids[key] = did
 
             if "raid" in job_name or "defend" in job_name:
-                hours_by_type[medic]["Raid"] += job_hours
+                hours_by_type[key]["Raid"] += job_hours
+                counts_by_type[key]["Raid/Defense"] += 1
             elif "lmpf" in job_name:
-                hours_by_type[medic]["LMPF"] += job_hours
+                hours_by_type[key]["LMPF"] += job_hours
             elif "healing" in job_name or "lowbie" in job_name:
-                hours_by_type[medic]["Healing"] += job_hours
+                hours_by_type[key]["Healing"] += job_hours
             elif "rev" in job_name or "spar" in job_name:
-                hours_by_type[medic]["Rev/Spar"] += job_hours
+                hours_by_type[key]["Rev/Spar"] += job_hours
             elif "escort" in job_name:
-                hours_by_type[medic]["Escort"] += job_hours
+                hours_by_type[key]["Escort"] += job_hours
             elif "world" in job_name:
-                hours_by_type[medic]["World Boss"] += job_hours
+                hours_by_type[key]["World Boss"] += job_hours
             elif "arc" in job_name:
-                hours_by_type[medic]["Arc"] += job_hours
+                hours_by_type[key]["Arc"] += job_hours
             elif "mission" in job_name:
-                hours_by_type[medic]["Mission"] += job_hours
+                hours_by_type[key]["Mission"] += job_hours
             elif "hosted event" in job_name:
-                hours_by_type[medic]["Hosted Event"] += job_hours
+                hours_by_type[key]["Hosted Event"] += job_hours
+                counts_by_type[key]["Hosted Event"] += 1
             elif "host training event" in job_name:
-                hours_by_type[medic]["Host Training Event"] += job_hours
+                hours_by_type[key]["Host Training Event"] += job_hours
+                counts_by_type[key]["Host Training Event"] += 1
             elif "participate in training event" in job_name:
-                hours_by_type[medic]["Participate In Training Event"] += job_hours
+                hours_by_type[key]["Participate In Training Event"] += job_hours
+                counts_by_type[key]["Participate In Training Event"] += 1
 
     output = [MASTER_HEADERS]
 
-    for medic in sorted(jobs.keys()):
-        rank = existing_ranks.get(medic, "Unranked")
+    for key in sorted(jobs.keys(), key=lambda k: display_names.get(k, k).lower()):
+        medic = display_names.get(key, key)
+        rank = existing_ranks.get(key, "Unranked")
         bonus_mult = bonus_from_rank(rank)
-        adjusted = raw_points[medic] * bonus_mult
+        adjusted = raw_points[key] * bonus_mult
+        did = discord_ids.get(key, key[3:] if key.startswith("id:") else "")
 
         output.append([
             medic,
             rank,
-            jobs[medic],
-            raw_points[medic],
+            jobs[key],
+            raw_points[key],
             adjusted,
-            round(hours[medic], 2),
-            round(hours_by_type[medic]["Raid"], 2),
-            round(hours_by_type[medic]["LMPF"], 2),
-            round(hours_by_type[medic]["Healing"], 2),
-            round(hours_by_type[medic]["Rev/Spar"], 2),
-            round(hours_by_type[medic]["Escort"], 2),
-            round(hours_by_type[medic]["World Boss"], 2),
-            round(hours_by_type[medic]["Arc"], 2),
-            round(hours_by_type[medic]["Mission"], 2),
-            round(hours_by_type[medic]["Hosted Event"], 2),
-            round(hours_by_type[medic]["Host Training Event"], 2),
-            round(hours_by_type[medic]["Participate In Training Event"], 2),
+            round(hours[key], 2),
+            round(hours_by_type[key]["Raid"], 2),
+            round(hours_by_type[key]["LMPF"], 2),
+            round(hours_by_type[key]["Healing"], 2),
+            round(hours_by_type[key]["Rev/Spar"], 2),
+            round(hours_by_type[key]["Escort"], 2),
+            round(hours_by_type[key]["World Boss"], 2),
+            round(hours_by_type[key]["Arc"], 2),
+            round(hours_by_type[key]["Mission"], 2),
+            round(hours_by_type[key]["Hosted Event"], 2),
+            round(hours_by_type[key]["Host Training Event"], 2),
+            round(hours_by_type[key]["Participate In Training Event"], 2),
+            f"'{did}" if did else "",
+            total_clients[key],
+            counts_by_type[key]["Raid/Defense"],
+            counts_by_type[key]["Hosted Event"],
+            counts_by_type[key]["Host Training Event"],
+            counts_by_type[key]["Participate In Training Event"],
         ])
 
     if len(output) <= 1:
         print("🚫 Master log rebuild aborted — no parsed data")
-        return
+        return False
 
-    # IMPORTANT: only rebuild if ranks exist; otherwise you'd wipe ranks
-    if len(existing_ranks) > 0:
-        master.clear()
-        master.update("A1", output)
-        master.resize(cols=len(MASTER_HEADERS))
-        invalidate_master_cache()
-        print("✅ Leaf Master Medical Log updated")
-    else:
-        print("🚫 Aborting master log rebuild — ranks would be lost")
+    # If an existing populated sheet somehow yields no rank map, avoid wiping it.
+    # A brand-new sheet is safe to initialize with Unranked (= Intern Medic).
+    if existing_records and not existing_ranks and not master_was_created:
+        print("🚫 Aborting master log rebuild — existing ranks could not be preserved")
+        return False
+
+    master.clear()
+    master.update("A1", output)
+    master.resize(cols=len(MASTER_HEADERS))
+    invalidate_master_cache()
+    print("✅ Leaf Master Medical Log updated")
+    return True
 
 
 def set_rank_in_master_log(medic_name: str, rank: str) -> str:
@@ -688,26 +797,146 @@ def set_rank_in_master_log(medic_name: str, rank: str) -> str:
         return f"Updated **{medic}** rank to **{rank}**."
 
 
+def link_medic_discord_id(medic_name: str, discord_id: int) -> str:
+    """Link an existing/legacy Master Log medic name to a stable Discord ID."""
+    master = SS.worksheet("Leaf Master Medical Log")
+    records = get_master_records_cached(master, force=True)
+    name_map = load_medic_normalization()
+    medic = normalize_medic_name(medic_name.strip(), name_map)
+
+    target_row = None
+    for i, row in enumerate(records, start=2):
+        existing = str(row.get("Medic", "") or "").strip()
+        if existing and existing.lower() == medic.lower():
+            target_row = i
+            break
+
+    if target_row is None:
+        raise ValueError(f"No Master Log medic found matching '{medic_name}'.")
+
+    discord_col = MASTER_HEADERS.index("Discord ID") + 1
+    master.update_cell(target_row, discord_col, f"'{discord_id}")
+    invalidate_master_cache()
+    return f"Linked **{medic}** to Discord user ID `{discord_id}`."
+
+
+
+# ================= WORDPRESS / LVMC CORE SYNC =================
+def wordpress_sync_configured() -> bool:
+    return bool(WORDPRESS_SYNC_URL and WORDPRESS_SYNC_SECRET)
+
+
+def build_wordpress_sync_payload():
+    """Build one batch payload from the lifetime Master Medical Log."""
+    master = SS.worksheet("Leaf Master Medical Log")
+    records = get_master_records_cached(master, force=True)
+    medics = []
+    skipped_without_id = []
+
+    for row in records:
+        medic_name = str(row.get("Medic", "") or "").strip()
+        discord_id = clean_sheet_id(row.get("Discord ID", ""))
+        if not medic_name:
+            continue
+        if not discord_id:
+            skipped_without_id.append(medic_name)
+            continue
+
+        medics.append({
+            "discord_id": discord_id,
+            "medic_name": medic_name,
+            "sheet_rank": str(row.get("Rank", "Unranked") or "Unranked"),
+            "total_jobs": row.get("Total Jobs", 0) or 0,
+            "raw_points": row.get("Total Raw Points", 0) or 0,
+            "adjusted_points": row.get("Total Adjusted Points", 0) or 0,
+            "total_hours": row.get("Total Hours", 0) or 0,
+            "total_clients": row.get("Total Clients", 0) or 0,
+            "raid_defense_count": row.get("Raid/Defense Count", 0) or 0,
+            "hosted_event_count": row.get("Hosted Event Count", 0) or 0,
+            "host_training_count": row.get("Host Training Count", 0) or 0,
+            "training_participation_count": row.get("Training Participation Count", 0) or 0,
+            "raid_hours": row.get("Raid", 0) or 0,
+            "lmpf_hours": row.get("LMPF", 0) or 0,
+            "healing_hours": row.get("Healing", 0) or 0,
+            "rev_spar_hours": row.get("Rev/Spar", 0) or 0,
+            "escort_hours": row.get("Escort", 0) or 0,
+            "world_boss_hours": row.get("World Boss", 0) or 0,
+            "arc_hours": row.get("Arc", 0) or 0,
+            "mission_hours": row.get("Mission", 0) or 0,
+            "hosted_event_hours": row.get("Hosted Event", 0) or 0,
+            "host_training_hours": row.get("Host Training Event", 0) or 0,
+            "training_participation_hours": row.get("Participate In Training Event", 0) or 0,
+        })
+
+    return {
+        "source": "medbot",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "medics": medics,
+    }, skipped_without_id
+
+
+def push_wordpress_sync():
+    """Push lifetime medic statistics to LVMC Core's authenticated REST endpoint."""
+    if not wordpress_sync_configured():
+        return {
+            "ok": False,
+            "skipped": True,
+            "message": "WordPress sync is not configured (LVMC_WORDPRESS_SYNC_URL / SECRET).",
+        }
+
+    try:
+        payload, skipped_without_id = build_wordpress_sync_payload()
+        if not payload["medics"]:
+            return {
+                "ok": False,
+                "skipped": True,
+                "message": "No Master Log medics currently have Discord IDs.",
+                "without_discord_id": skipped_without_id,
+            }
+
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            WORDPRESS_SYNC_URL,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-LVMC-Sync-Secret": WORDPRESS_SYNC_SECRET,
+                "User-Agent": "LVMC-MedBot/1.0",
+            },
+        )
+
+        with urllib.request.urlopen(request, timeout=15) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(response_body) if response_body else {}
+            except json.JSONDecodeError:
+                parsed = {"raw_response": response_body}
+
+        result = {
+            "ok": True,
+            "sent": len(payload["medics"]),
+            "without_discord_id": skipped_without_id,
+            "wordpress": parsed,
+        }
+        print(
+            "✅ WordPress sync complete:",
+            f"sent={result['sent']}",
+            f"unlinked-sheet-medics={len(skipped_without_id)}",
+        )
+        return result
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+        print(f"⚠️ WordPress sync HTTP {e.code}: {error_body}")
+        return {"ok": False, "message": f"HTTP {e.code}", "response": error_body}
+    except Exception as e:
+        print(f"⚠️ WordPress sync failed: {e}")
+        return {"ok": False, "message": str(e)}
+
 
 # ================= REPORT EDIT HELPERS =================
-def clean_sheet_id(value) -> str:
-    text = str(value or "").strip()
-
-    # Remove leading apostrophe if we added one to force Google Sheets text
-    if text.startswith("'"):
-        text = text[1:]
-
-    # Remove trailing .0 if Google Sheets gave us a float-looking value
-    if text.endswith(".0"):
-        text = text[:-2]
-
-    return text
-
-def split_names(value: str):
-    """Split comma-separated names, also allowing the word 'and'."""
-    return [x.strip() for x in re.split(r",|\band\b", str(value or "")) if x.strip()]
-
-
 def parse_report_duration_to_minutes(duration_value) -> int:
     """Convert values like '60 min' or '60' into an integer minute count."""
     text = str(duration_value or "0").strip()
@@ -796,11 +1025,14 @@ def user_can_edit_report(interaction: discord.Interaction, row: dict) -> bool:
 
 
 async def rebuild_after_report_change():
-    """Rebuild derived sheets after a report is added/edited, but respect throttling."""
+    """Rebuild derived sheets after a report is added/edited, then push fresh lifetime stats."""
+    master_updated = False
     if should_run("master"):
-        update_master_log()
+        master_updated = bool(update_master_log())
     if should_run("leaderboard"):
         update_leaderboard()
+    if master_updated and wordpress_sync_configured():
+        await asyncio.to_thread(push_wordpress_sync)
 
 # ================= DISCORD BOT =================
 intents = discord.Intents.default()
@@ -821,6 +1053,7 @@ tree = discord.app_commands.CommandTree(bot)
 )
 @discord.app_commands.choices(
     rank=[
+        discord.app_commands.Choice(name="Intern Medic", value="Unranked"),
         discord.app_commands.Choice(name="Field Medic", value="Field Medic"),
         discord.app_commands.Choice(name="Junior Medic", value="Junior Medic"),
         discord.app_commands.Choice(name="Senior Medic", value="Senior Medic"),
@@ -844,16 +1077,51 @@ async def setrank(
         msg = set_rank_in_master_log(medic, rank.value)
 
         # Recalculate derived data immediately (throttled)
+        master_updated = False
         if should_run("master"):
-            update_master_log()
+            master_updated = bool(update_master_log())
         if should_run("leaderboard"):
             update_leaderboard()
+        sync_note = ""
+        if master_updated and wordpress_sync_configured():
+            sync_result = await asyncio.to_thread(push_wordpress_sync)
+            sync_note = "\nWebsite sync: **complete**" if sync_result.get("ok") else "\nWebsite sync: **failed/skipped**"
 
+        rank_label = "Intern Medic (stored as Unranked)" if rank.value == "Unranked" else rank.value
         await interaction.followup.send(
-            f"✅ {msg}\nBonus applied: **×{bonus_from_rank(rank.value)}**"
+            f"✅ Rank set to **{rank_label}**.\nBonus applied: **×{bonus_from_rank(rank.value)}**{sync_note}"
         )
     except Exception as e:
         await interaction.followup.send(f"⚠️ Error setting rank: {e}")
+
+
+@tree.command(
+    name="linkmedic",
+    description="Link a Master Log medic to their Discord account (admin only)"
+)
+@discord.app_commands.describe(
+    medic="Medic name exactly as it appears in the Master Medical Log",
+    member="The Discord member who owns this medic profile",
+)
+@discord.app_commands.guilds(discord.Object(id=GUILD_ID))
+async def linkmedic(
+    interaction: discord.Interaction,
+    medic: str,
+    member: discord.Member,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("🚫 Admins only.")
+        return
+
+    try:
+        msg = link_medic_discord_id(medic, member.id)
+        await interaction.followup.send(
+            f"✅ {msg}\nRun `/updatelogs` to merge legacy rows under that Discord identity."
+        )
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error linking medic: {e}")
 
 
 @tree.command(name="updatelogs", description="Force update ALL leaderboard sheets and the master log.")
@@ -863,9 +1131,13 @@ async def update_logs(interaction: discord.Interaction):
     try:
         # force fresh cache reads for a manual rebuild
         get_raw_records_cached(force=True)
-        update_master_log()
+        master_updated = bool(update_master_log())
         update_all_leaderboards()
-        await interaction.followup.send("✅ All logs and leaderboards updated!")
+        sync_note = ""
+        if master_updated and wordpress_sync_configured():
+            sync_result = await asyncio.to_thread(push_wordpress_sync)
+            sync_note = " Website sync complete." if sync_result.get("ok") else " Website sync failed/skipped."
+        await interaction.followup.send(f"✅ All logs and leaderboards updated!{sync_note}")
     except Exception as e:
         await interaction.followup.send(f"⚠️ Error: {e}")
 
@@ -931,6 +1203,34 @@ async def set_ryo(interaction: discord.Interaction, year: int, month: int, amoun
     )
 
 
+@tree.command(name="syncwebsite", description="Push current Master Medical Log stats to the LVMC website (admin only)")
+@discord.app_commands.guilds(discord.Object(id=GUILD_ID))
+async def syncwebsite(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("🚫 Admins only.")
+        return
+    if not wordpress_sync_configured():
+        await interaction.followup.send(
+            "⚠️ Website sync is not configured. Set `LVMC_WORDPRESS_SYNC_URL` and `LVMC_WORDPRESS_SYNC_SECRET` on the VM."
+        )
+        return
+
+    result = await asyncio.to_thread(push_wordpress_sync)
+    if not result.get("ok"):
+        await interaction.followup.send(f"⚠️ Website sync failed/skipped: {result.get('message','Unknown error')}")
+        return
+
+    wp = result.get("wordpress", {}) if isinstance(result.get("wordpress"), dict) else {}
+    await interaction.followup.send(
+        "✅ Website sync complete.\n"
+        f"• Sent from Master Log: **{result.get('sent',0)}**\n"
+        f"• WordPress matched: **{wp.get('matched','?')}**\n"
+        f"• WordPress unmatched: **{len(wp.get('unmatched',[])) if isinstance(wp.get('unmatched'),list) else '?'}**\n"
+        f"• Master rows without Discord ID: **{len(result.get('without_discord_id',[]))}**"
+    )
+
+
 @tree.command(name="leaderboard", description="Show this month's medic leaderboard")
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
 async def leaderboard_cmd(interaction: discord.Interaction):
@@ -986,6 +1286,7 @@ async def medicstats(interaction: discord.Interaction, name: str):
 
         medic = target.get("Medic", "Unknown")
         rank = target.get("Rank", "Unranked")
+        rank_display = "Intern Medic" if str(rank).lower() == "unranked" else rank
         jobs = target.get("Total Jobs", 0)
         raw = target.get("Total Raw Points", 0)
         adj = target.get("Total Adjusted Points", 0)
@@ -1002,13 +1303,29 @@ async def medicstats(interaction: discord.Interaction, name: str):
         event_h = target.get("Hosted Event", 0)
         host_training_h = target.get("Host Training Event", 0)
         participate_training_h = target.get("Participate In Training Event", 0)
+        total_clients = target.get("Total Clients", 0)
+        raid_count = target.get("Raid/Defense Count", 0)
+        hosted_event_count = target.get("Hosted Event Count", 0)
+        host_training_count = target.get("Host Training Count", 0)
+        training_participation_count = target.get("Training Participation Count", 0)
 
         embed = discord.Embed(title=f"💠 Lifetime Stats — {medic}", color=0x3498DB)
-        embed.add_field(name="Rank", value=rank, inline=True)
+        embed.add_field(name="Rank", value=rank_display, inline=True)
         embed.add_field(name="Total Jobs", value=jobs, inline=True)
         embed.add_field(name="Total Raw Points", value=raw, inline=True)
         embed.add_field(name="Total Adjusted Points", value=adj, inline=True)
         embed.add_field(name="Total Hours", value=hours, inline=True)
+        embed.add_field(name="Total Clients", value=total_clients, inline=True)
+        embed.add_field(
+            name="Promotion Activity",
+            value=(
+                f"• **Raids / Defenses:** {raid_count}\n"
+                f"• **Hosted Events:** {hosted_event_count}\n"
+                f"• **Hosted Trainings:** {host_training_count}\n"
+                f"• **Training Participation:** {training_participation_count}"
+            ),
+            inline=False,
+        )
         embed.add_field(
             name="Hours Breakdown",
             value=(
@@ -1095,15 +1412,31 @@ async def editreport(interaction: discord.Interaction, report_id: str):
         return
 
     current_job = str(existing_row.get("Job Name", "")).strip() or "Raid / Defend"
+    existing_pairs = report_medic_pairs(existing_row)
+    current_medic_names = [name for name, _ in existing_pairs]
+    current_medic_ids = [did for _, did in existing_pairs]
 
-    async def open_edit_modal(trigger_interaction: discord.Interaction, selected_job_type: str):
-        """Open the edit modal using either the current job or a newly selected job."""
+    async def open_edit_modal(
+        trigger_interaction: discord.Interaction,
+        selected_job_type: str,
+        selected_members=None,
+    ):
+        """Open the edit modal after optional job/medic changes are selected."""
+        if selected_members:
+            medic_list = [member_display_name(m) for m in selected_members]
+            medic_ids = [str(m.id) for m in selected_members]
+        else:
+            medic_list = current_medic_names
+            medic_ids = current_medic_ids
+
+        if not medic_list:
+            await trigger_interaction.response.send_message(
+                "⚠️ This report has no medic names. Select at least one medic first.",
+                ephemeral=True,
+            )
+            return
 
         class EditReportModal(discord.ui.Modal, title="Edit Medic Report"):
-            medics = discord.ui.TextInput(
-                label="Medic Names (Separate by ,)",
-                default=str(existing_row.get("Medics", ""))[:4000],
-            )
             report_date = discord.ui.TextInput(
                 label="Report Date (MM/DD/YYYY)",
                 default=str(existing_row.get("Report Date", ""))[:4000],
@@ -1126,19 +1459,6 @@ async def editreport(interaction: discord.Interaction, report_id: str):
                 try:
                     await modal_interaction.response.defer(ephemeral=True)
 
-                    name_map = load_medic_normalization()
-                    medic_list = [
-                        normalize_medic_name(m.strip(), name_map)
-                        for m in split_names(self.medics.value)
-                    ]
-
-                    if not medic_list:
-                        await modal_interaction.followup.send(
-                            "⚠️ You need at least one medic name.",
-                            ephemeral=True,
-                        )
-                        return
-
                     date_obj = parse_report_date_value(self.report_date.value)
                     if not date_obj:
                         await modal_interaction.followup.send(
@@ -1158,13 +1478,11 @@ async def editreport(interaction: discord.Interaction, report_id: str):
 
                     if duration_minutes < 0:
                         await modal_interaction.followup.send(
-                            "⚠️ Duration cannot be negative.",
-                            ephemeral=True,
+                            "⚠️ Duration cannot be negative.", ephemeral=True
                         )
                         return
 
                     clients_text = str(self.clients.value).strip()
-
                     if clients_text.isdigit():
                         clients_count = int(clients_text)
                         participant_names = clients_text
@@ -1184,7 +1502,8 @@ async def editreport(interaction: discord.Interaction, report_id: str):
                     old_channel_id = clean_sheet_id(existing_row.get("Channel ID", "")).strip()
 
                     updated_row = [
-                        str(existing_row.get("Timestamp", "")).strip() or datetime.now().strftime("%m/%d/%Y %H:%M"),
+                        str(existing_row.get("Timestamp", "")).strip()
+                        or datetime.now().strftime("%m/%d/%Y %H:%M"),
                         ", ".join(medic_list),
                         job_type,
                         f"{duration_minutes} min",
@@ -1198,6 +1517,7 @@ async def editreport(interaction: discord.Interaction, report_id: str):
                         old_reporter_name,
                         f"'{old_message_id}",
                         f"'{old_channel_id}",
+                        serialize_medic_discord_ids(medic_ids),
                     ]
 
                     if len(updated_row) != len(REPORT_HEADERS):
@@ -1206,26 +1526,20 @@ async def editreport(interaction: discord.Interaction, report_id: str):
                         )
 
                     SHEET.update(
-                        f"A{row_number}:N{row_number}",
+                        f"A{row_number}:O{row_number}",
                         [updated_row],
                         value_input_option="USER_ENTERED",
                     )
                     SHEET.resize(cols=len(REPORT_HEADERS))
                     invalidate_raw_cache()
 
-                    # Try to update the original public Discord embed.
                     embed_edit_note = ""
                     try:
                         channel = bot.get_channel(int(old_channel_id)) or await bot.fetch_channel(int(old_channel_id))
                         msg = await channel.fetch_message(int(old_message_id))
                         embed = build_report_embed(
-                            job_type,
-                            desc,
-                            date_obj,
-                            medic_list,
-                            duration_minutes,
-                            clients_count,
-                            points,
+                            job_type, desc, date_obj, medic_list,
+                            duration_minutes, clients_count, points,
                         )
                         await msg.edit(embed=embed)
                     except Exception as embed_error:
@@ -1233,63 +1547,87 @@ async def editreport(interaction: discord.Interaction, report_id: str):
                         print(f"⚠️ Sheet updated, but could not edit Discord embed: {embed_error}")
 
                     await rebuild_after_report_change()
-
                     await modal_interaction.followup.send(
-                        f"✅ Report `{old_message_id}` updated. Job: **{job_type}**. New points: **{points}**.{embed_edit_note}",
+                        f"✅ Report `{old_message_id}` updated. Job: **{job_type}**. "
+                        f"Medics: **{', '.join(medic_list)}**. New points: **{points}**.{embed_edit_note}",
                         ephemeral=True,
                     )
-
                 except Exception as e:
-                    await modal_interaction.followup.send(f"⚠️ Error editing report: {e}", ephemeral=True)
+                    await modal_interaction.followup.send(
+                        f"⚠️ Error editing report: {e}", ephemeral=True
+                    )
 
         await trigger_interaction.response.send_modal(EditReportModal())
 
     class EditJobSelect(discord.ui.Select):
-        def __init__(self):
+        def __init__(self, parent_view):
+            self.parent_view = parent_view
             options = [
-                discord.SelectOption(
-                    label=label,
-                    value=value,
-                    default=(value == current_job),
-                )
+                discord.SelectOption(label=label, value=value, default=(value == current_job))
                 for label, value in JOB_OPTIONS
             ]
-
             super().__init__(
                 placeholder="Optional: choose a different job type...",
                 options=options,
             )
 
         async def callback(self, select_interaction: discord.Interaction):
-            if select_interaction.user.id != interaction.user.id:
+            self.parent_view.selected_job = self.values[0]
+            await select_interaction.response.defer()
+
+    class EditMedicSelect(discord.ui.UserSelect):
+        def __init__(self, parent_view):
+            self.parent_view = parent_view
+            super().__init__(
+                placeholder="Optional: select replacement medic(s)...",
+                min_values=1,
+                max_values=25,
+            )
+
+        async def callback(self, select_interaction: discord.Interaction):
+            selected = list(self.values)
+            if any(getattr(member, "bot", False) for member in selected):
                 await select_interaction.response.send_message(
-                    "🚫 This edit menu is not for you.",
-                    ephemeral=True,
+                    "⚠️ Bots cannot be selected as medics.", ephemeral=True
                 )
                 return
-
-            await open_edit_modal(select_interaction, self.values[0])
+            self.parent_view.selected_members = selected
+            await select_interaction.response.defer()
 
     class EditReportView(discord.ui.View):
         def __init__(self):
-            super().__init__(timeout=120)
-            self.add_item(EditJobSelect())
+            super().__init__(timeout=180)
+            self.selected_job = current_job
+            self.selected_members = None
+            self.add_item(EditJobSelect(self))
+            self.add_item(EditMedicSelect(self))
 
-        @discord.ui.button(label="Keep current job and edit details", style=discord.ButtonStyle.primary)
-        async def keep_current_job(self, button_interaction: discord.Interaction, button: discord.ui.Button):
-            if button_interaction.user.id != interaction.user.id:
-                await button_interaction.response.send_message(
-                    "🚫 This edit menu is not for you.",
-                    ephemeral=True,
+        async def interaction_check(self, view_interaction: discord.Interaction) -> bool:
+            if view_interaction.user.id != interaction.user.id:
+                await view_interaction.response.send_message(
+                    "🚫 This edit menu is not for you.", ephemeral=True
                 )
-                return
+                return False
+            return True
 
-            await open_edit_modal(button_interaction, current_job)
+        @discord.ui.button(label="Continue to edit details", style=discord.ButtonStyle.primary)
+        async def continue_edit(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+            await open_edit_modal(
+                button_interaction,
+                self.selected_job,
+                self.selected_members,
+            )
 
+    current_ids_note = (
+        "Discord IDs are already attached to this report."
+        if any(current_medic_ids)
+        else "This is a legacy report with no medic Discord IDs yet. Select the medic(s) above if you want to attach IDs while editing."
+    )
     await interaction.response.send_message(
-        f"Current job type: **{current_job}**\n\n"
-        "Click **Keep current job and edit details** to edit minutes/clients/etc. without changing the job.\n"
-        "Or use the dropdown only if you need to change the job type.",
+        f"Current job: **{current_job}**\n"
+        f"Current medics: **{', '.join(current_medic_names) or 'None'}**\n"
+        f"{current_ids_note}\n\n"
+        "Optionally change the job and/or medic selection, then click **Continue to edit details**.",
         view=EditReportView(),
         ephemeral=True,
     )
@@ -1298,23 +1636,43 @@ async def editreport(interaction: discord.Interaction, report_id: str):
 @tree.command(name="report", description="Submit a medic report")
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
 async def report(interaction: discord.Interaction):
+    """Submit a report using Discord member selection so every medic gets a stable ID."""
 
-    class JobSelect(discord.ui.Select):
+    class ReportSetupView(discord.ui.View):
         def __init__(self):
-            options = [
-                discord.SelectOption(label=label, value=value)
-                for label, value in JOB_OPTIONS
-            ]
-            super().__init__(placeholder="Choose Job Type...", options=options)
+            super().__init__(timeout=180)
+            self.owner_id = interaction.user.id
+            self.selected_members = []
+            self.selected_job = None
+            self.add_item(MedicSelect(self))
+            self.add_item(JobSelect(self))
 
-        async def callback(self, select_interaction: discord.Interaction):
-            job_type = self.values[0]
+        async def interaction_check(self, view_interaction: discord.Interaction) -> bool:
+            if view_interaction.user.id != self.owner_id:
+                await view_interaction.response.send_message(
+                    "🚫 This report menu is not for you.", ephemeral=True
+                )
+                return False
+            return True
+
+        @discord.ui.button(label="Continue to report", style=discord.ButtonStyle.primary)
+        async def continue_report(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+            if not self.selected_members:
+                await button_interaction.response.send_message(
+                    "⚠️ Select at least one medic first.", ephemeral=True
+                )
+                return
+            if not self.selected_job:
+                await button_interaction.response.send_message(
+                    "⚠️ Choose a job type first.", ephemeral=True
+                )
+                return
+
+            medic_list = [member_display_name(m) for m in self.selected_members]
+            medic_ids = [str(m.id) for m in self.selected_members]
+            job_type = self.selected_job
 
             class ReportModal(discord.ui.Modal, title="Medic Job Report"):
-                medics = discord.ui.TextInput(
-                    label="Medic Names(Separate by ,)",
-                    placeholder="Example: Leumas, LeaKiara, Ragnor Reaper",
-                )
                 date = discord.ui.TextInput(
                     label="Date (blank = today, MM/DD/YYYY)",
                     required=False,
@@ -1325,8 +1683,8 @@ async def report(interaction: discord.Interaction):
                     placeholder="5:00 pm - 6:00 pm",
                 )
                 clients = discord.ui.TextInput(
-                    label="Clients(Separate by ,)",
-                    placeholder="Example: Leumas, LeaKiara, Ragnor Reaper",
+                    label="Clients (Separate by ,)",
+                    placeholder="Example: PlayerOne, PlayerTwo",
                 )
                 description = discord.ui.TextInput(
                     label="Description", style=discord.TextStyle.long
@@ -1352,17 +1710,7 @@ async def report(interaction: discord.Interaction):
                     try:
                         await modal_interaction.response.defer(ephemeral=True)
 
-                        name_map = load_medic_normalization()
-                        medic_list = [
-                            normalize_medic_name(m.strip(), name_map)
-                            for m in split_names(self.medics.value)
-                        ]
-
-                        clients_list = [
-                            p.strip()
-                            for p in split_names(self.clients.value)
-                        ]
-
+                        clients_list = [p.strip() for p in split_names(self.clients.value)]
                         date_obj = (
                             self.parse_date(self.date.value)
                             if self.date.value.strip()
@@ -1386,7 +1734,6 @@ async def report(interaction: discord.Interaction):
 
                         start = self.parse_time(t[0])
                         end = self.parse_time(t[1])
-
                         if not start or not end:
                             await modal_interaction.followup.send(
                                 "⚠️ Invalid time format. Use `HH:MM` or `H:MM AM/PM` with `-` or `to`.",
@@ -1404,15 +1751,9 @@ async def report(interaction: discord.Interaction):
                         desc = self.description.value.strip()
 
                         embed = build_report_embed(
-                            job_type,
-                            desc,
-                            date_obj,
-                            medic_list,
-                            duration,
-                            len(clients_list),
-                            points,
+                            job_type, desc, date_obj, medic_list,
+                            duration, len(clients_list), points,
                         )
-
                         msg = await modal_interaction.channel.send(embed=embed)
 
                         link = f"https://discord.com/channels/{modal_interaction.guild.id}/{modal_interaction.channel.id}/{msg.id}"
@@ -1433,6 +1774,7 @@ async def report(interaction: discord.Interaction):
                             str(modal_interaction.user),
                             f"'{msg.id}",
                             f"'{modal_interaction.channel.id}",
+                            serialize_medic_discord_ids(medic_ids),
                         ]
 
                         if len(report_row) != len(REPORT_HEADERS):
@@ -1443,34 +1785,54 @@ async def report(interaction: discord.Interaction):
                         SHEET.append_row(
                             report_row,
                             value_input_option="USER_ENTERED",
-                            table_range="A1:N1",
+                            table_range="A1:O1",
                         )
                         SHEET.resize(cols=len(REPORT_HEADERS))
-
-                        # New row exists, so cached records are stale
                         invalidate_raw_cache()
-
-                        # Rebuild derived sheets, but throttle to prevent quota spikes
                         await rebuild_after_report_change()
 
                         await modal_interaction.followup.send(
-                            "✅ Report logged and sheets queued for update (throttled).",
+                            "✅ Report logged with Discord-linked medic identities and sheets queued for update (throttled).",
                             ephemeral=True,
                         )
-
                     except Exception as e:
                         await modal_interaction.followup.send(f"⚠️ Error: {e}", ephemeral=True)
 
-            await select_interaction.response.send_modal(ReportModal())
+            await button_interaction.response.send_modal(ReportModal())
 
-    class JobSelectView(discord.ui.View):
-        def __init__(self):
-            super().__init__(timeout=60)
-            self.add_item(JobSelect())
+    class MedicSelect(discord.ui.UserSelect):
+        def __init__(self, parent_view):
+            self.parent_view = parent_view
+            super().__init__(
+                placeholder="Select the medic(s) who participated...",
+                min_values=1,
+                max_values=25,
+            )
+
+        async def callback(self, select_interaction: discord.Interaction):
+            selected = list(self.values)
+            if any(getattr(member, "bot", False) for member in selected):
+                await select_interaction.response.send_message(
+                    "⚠️ Bots cannot be selected as medics.", ephemeral=True
+                )
+                return
+            self.parent_view.selected_members = selected
+            await select_interaction.response.defer()
+
+    class JobSelect(discord.ui.Select):
+        def __init__(self, parent_view):
+            self.parent_view = parent_view
+            options = [discord.SelectOption(label=label, value=value) for label, value in JOB_OPTIONS]
+            super().__init__(placeholder="Choose Job Type...", options=options)
+
+        async def callback(self, select_interaction: discord.Interaction):
+            self.parent_view.selected_job = self.values[0]
+            await select_interaction.response.defer()
 
     await interaction.response.send_message(
-        "Choose your **Job Type** to begin your report:",
-        view=JobSelectView(),
+        "Select the **medic(s)** and **job type**, then click **Continue to report**.\n"
+        "The bot will save each medic's Discord ID with the report so names can change without breaking their stats.",
+        view=ReportSetupView(),
         ephemeral=True,
     )
 
