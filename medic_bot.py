@@ -24,6 +24,11 @@ GUILD_ID = 861362652710174740  # your real server (guild) ID
 # Optional WordPress push sync. Leave blank until LVMC Core v0.3+ is configured.
 WORDPRESS_SYNC_URL = os.getenv("LVMC_WORDPRESS_SYNC_URL", "").strip()
 WORDPRESS_SYNC_SECRET = os.getenv("LVMC_WORDPRESS_SYNC_SECRET", "").strip()
+WORDPRESS_NOTIFICATION_URL = os.getenv("LVMC_WORDPRESS_NOTIFICATION_URL", "").strip()
+if not WORDPRESS_NOTIFICATION_URL and WORDPRESS_SYNC_URL:
+    WORDPRESS_NOTIFICATION_URL = WORDPRESS_SYNC_URL.rsplit("/", 1)[0] + "/discord-notifications"
+WORDPRESS_NOTIFICATION_ACK_URL = WORDPRESS_NOTIFICATION_URL.rstrip("/") + "/ack" if WORDPRESS_NOTIFICATION_URL else ""
+WORDPRESS_NOTIFICATION_POLL_SECONDS = max(30, int(os.getenv("LVMC_WORDPRESS_NOTIFICATION_POLL_SECONDS", "60") or 60))
 
 VALID_RANKS = [
     # Intern Medic is stored as "Unranked" in the medical spreadsheet.
@@ -935,6 +940,120 @@ def push_wordpress_sync():
         print(f"⚠️ WordPress sync failed: {e}")
         return {"ok": False, "message": str(e)}
 
+
+
+# ================= WORDPRESS -> DISCORD NOTIFICATIONS =================
+def wordpress_notification_configured() -> bool:
+    return bool(WORDPRESS_NOTIFICATION_URL and WORDPRESS_NOTIFICATION_ACK_URL and WORDPRESS_SYNC_SECRET)
+
+
+def _wordpress_json_request(url: str, method: str = "GET", payload=None, timeout: int = 15):
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-LVMC-Sync-Secret": WORDPRESS_SYNC_SECRET,
+            "User-Agent": "LVMC-MedBot/3.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+        return json.loads(raw) if raw else {}
+
+
+def pull_wordpress_notifications():
+    if not wordpress_notification_configured():
+        return []
+    try:
+        data = _wordpress_json_request(WORDPRESS_NOTIFICATION_URL, "GET")
+        items = data.get("notifications", []) if isinstance(data, dict) else []
+        return items if isinstance(items, list) else []
+    except Exception as e:
+        print(f"⚠️ Could not pull WordPress notifications: {e}")
+        return []
+
+
+def ack_wordpress_notifications(sent_ids, failed_ids=None):
+    if not wordpress_notification_configured():
+        return
+    try:
+        _wordpress_json_request(
+            WORDPRESS_NOTIFICATION_ACK_URL,
+            "POST",
+            {"ids": list(sent_ids or []), "failed_ids": list(failed_ids or [])},
+        )
+    except Exception as e:
+        print(f"⚠️ Could not acknowledge WordPress notifications: {e}")
+
+
+async def deliver_wordpress_notification(item: dict) -> bool:
+    try:
+        discord_id = int(str(item.get("discord_id", "")).strip())
+    except (TypeError, ValueError):
+        return False
+
+    try:
+        user = bot.get_user(discord_id) or await bot.fetch_user(discord_id)
+        if not user:
+            return False
+
+        title = str(item.get("title", "LVMC Portal Update") or "LVMC Portal Update")[:200]
+        message = str(item.get("message", "") or "").strip()[:3000]
+        url = str(item.get("url", "") or "").strip()
+        kind = str(item.get("kind", "general") or "general")
+        context = item.get("context", {}) if isinstance(item.get("context"), dict) else {}
+
+        icons = {
+            "reply": "💬", "offer": "💰", "assignment": "⚕️", "status": "📌",
+            "completion": "✅", "medbot_report_prompt": "📋", "promotion": "🏅",
+            "new_request": "🚨",
+        }
+        icon = icons.get(kind, "🔔")
+        body = f"{icon} **{title}**\n{message}"
+        if kind == "medbot_report_prompt":
+            body += "\n\n**Next step:** If this qualifies as a Medical Corps job, use `/report` in the Leaf server to log it."
+            compensation = str(context.get("compensation", "") or "").strip()
+            if compensation:
+                body += f"\n**Agreed terms:** {compensation}"
+        if url:
+            body += f"\n\n🔗 {url}"
+
+        await user.send(body[:3900])
+        return True
+    except discord.Forbidden:
+        print(f"⚠️ Cannot DM Discord user {discord_id}; DMs may be disabled.")
+        return False
+    except Exception as e:
+        print(f"⚠️ Discord notification delivery failed for {discord_id}: {e}")
+        return False
+
+
+async def wordpress_notification_worker():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            items = await asyncio.to_thread(pull_wordpress_notifications)
+            sent_ids, failed_ids = [], []
+            for item in items:
+                notification_id = item.get("id")
+                ok = await deliver_wordpress_notification(item)
+                if notification_id:
+                    (sent_ids if ok else failed_ids).append(int(notification_id))
+                # Keep Discord API use gentle if several users are queued at once.
+                await asyncio.sleep(0.35)
+            if sent_ids or failed_ids:
+                await asyncio.to_thread(ack_wordpress_notifications, sent_ids, failed_ids)
+                print(f"🔔 Website notifications: delivered={len(sent_ids)} failed={len(failed_ids)}")
+        except Exception as e:
+            print(f"⚠️ WordPress notification worker error: {e}")
+        await asyncio.sleep(WORDPRESS_NOTIFICATION_POLL_SECONDS)
+
+
+_notification_worker_task = None
 
 # ================= REPORT EDIT HELPERS =================
 def parse_report_duration_to_minutes(duration_value) -> int:
@@ -1848,6 +1967,13 @@ async def on_ready():
     synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
     print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
     print(f"Logged in as {bot.user}")
+
+    global _notification_worker_task
+    if wordpress_notification_configured() and (_notification_worker_task is None or _notification_worker_task.done()):
+        _notification_worker_task = asyncio.create_task(wordpress_notification_worker())
+        print(f"🔔 WordPress Discord notifications enabled (poll every {WORDPRESS_NOTIFICATION_POLL_SECONDS}s)")
+    elif not wordpress_notification_configured():
+        print("ℹ️ WordPress Discord notification polling is not configured.")
 
 
 bot.run(DISCORD_TOKEN)
