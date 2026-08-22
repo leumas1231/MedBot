@@ -16,7 +16,7 @@ from collections import defaultdict
 
 load_dotenv()
 
-# Portal notification formatting: v3.2
+# Portal notification formatting + in-game org sync: v3.3
 # ================= CONFIG =================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = 1439473833273856120  # text channel if needed
@@ -30,8 +30,10 @@ WORDPRESS_NOTIFICATION_URL = os.getenv("LVMC_WORDPRESS_NOTIFICATION_URL", "").st
 if not WORDPRESS_NOTIFICATION_URL and WORDPRESS_SYNC_URL:
     WORDPRESS_NOTIFICATION_URL = WORDPRESS_SYNC_URL.rsplit("/", 1)[0] + "/discord-notifications"
 WORDPRESS_NOTIFICATION_ACK_URL = WORDPRESS_NOTIFICATION_URL.rstrip("/") + "/ack" if WORDPRESS_NOTIFICATION_URL else ""
+WORDPRESS_ORG_URL = WORDPRESS_SYNC_URL.rsplit("/", 1)[0] + "/medbot-org" if WORDPRESS_SYNC_URL else ""
 WORDPRESS_NOTIFICATION_POLL_SECONDS = max(30, int(os.getenv("LVMC_WORDPRESS_NOTIFICATION_POLL_SECONDS", "60") or 60))
 WORDPRESS_NOTIFICATION_CHANNEL_ID = int(os.getenv("LVMC_WORDPRESS_NOTIFICATION_CHANNEL_ID", "0") or 0)
+WORDPRESS_ORG_SYNC_SECONDS = max(60, int(os.getenv("LVMC_WORDPRESS_ORG_SYNC_SECONDS", "300") or 300))
 
 VALID_RANKS = [
     # Intern Medic is stored as "Unranked" in the medical spreadsheet.
@@ -945,6 +947,136 @@ def push_wordpress_sync():
 
 
 
+
+# ================= IN-GAME MEDICAL CORP ORGANIZATION SYNC =================
+def wordpress_org_configured() -> bool:
+    return bool(WORDPRESS_ORG_URL and WORDPRESS_SYNC_SECRET)
+
+
+def wordpress_org_status():
+    if not wordpress_org_configured():
+        return {
+            "ok": False,
+            "configured": False,
+            "url": WORDPRESS_ORG_URL or "(not configured)",
+            "error": "WordPress sync URL / secret are not fully configured.",
+        }
+    try:
+        data = _wordpress_json_request(WORDPRESS_ORG_URL, "GET")
+        return {
+            "ok": True,
+            "configured": True,
+            "url": WORDPRESS_ORG_URL,
+            "guild_id": str(data.get("guild_id", "") or ""),
+            "role_id": str(data.get("role_id", "") or ""),
+            "max_slots": int(data.get("max_slots", 20) or 20),
+            "current_count": int(data.get("current_count", 0) or 0),
+            "last_sync": int(data.get("last_sync", 0) or 0),
+        }
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+        return {"ok": False, "configured": True, "url": WORDPRESS_ORG_URL, "error": f"HTTP {e.code}: {body[:300]}"}
+    except Exception as e:
+        return {"ok": False, "configured": True, "url": WORDPRESS_ORG_URL, "error": str(e)}
+
+
+async def sync_ingame_org_once():
+    """Read the configured Medical Corp Discord role and push its complete membership to WordPress."""
+    if not wordpress_org_configured():
+        return {"ok": False, "skipped": True, "message": "WordPress organization sync is not configured."}
+
+    config = await asyncio.to_thread(wordpress_org_status)
+    if not config.get("ok"):
+        return {"ok": False, "message": str(config.get("error", "Could not read WordPress organization settings."))}
+
+    role_id_text = str(config.get("role_id", "") or "").strip()
+    guild_id_text = str(config.get("guild_id", "") or "").strip()
+    if not role_id_text:
+        return {"ok": False, "skipped": True, "message": "Set the Medical Corp in-game organization role ID in WordPress → LVMC Portal."}
+
+    try:
+        role_id = int(role_id_text)
+        guild_id = int(guild_id_text or GUILD_ID)
+    except ValueError:
+        return {"ok": False, "message": "Invalid guild or role ID returned by WordPress."}
+
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return {"ok": False, "message": f"MedBot is not connected to Discord guild {guild_id}."}
+
+    role = guild.get_role(role_id)
+    if role is None:
+        return {"ok": False, "message": f"Could not find Discord role {role_id} in {guild.name}."}
+
+    # With Server Members Intent enabled, role.members is the fastest path.
+    role_members = list(role.members)
+
+    # If the cache is empty, try an explicit member fetch. Discord still requires
+    # the privileged Server Members Intent for reliable full-roster access.
+    if not role_members:
+        try:
+            fetched = []
+            async for member in guild.fetch_members(limit=None):
+                if role in member.roles:
+                    fetched.append(member)
+            role_members = fetched
+        except Exception as e:
+            if getattr(role, "members", None) == []:
+                return {
+                    "ok": False,
+                    "message": (
+                        "Could not read the Medical Corp role membership. Enable Server Members Intent "
+                        f"for MedBot in the Discord Developer Portal and restart the bot. ({e})"
+                    ),
+                }
+
+    members_payload = []
+    for member in role_members:
+        members_payload.append({
+            "discord_id": str(member.id),
+            "display_name": member.display_name,
+            "username": str(member),
+            "avatar_url": str(member.display_avatar.url) if member.display_avatar else "",
+        })
+
+    try:
+        response = await asyncio.to_thread(
+            _wordpress_json_request,
+            WORDPRESS_ORG_URL,
+            "POST",
+            {"members": members_payload},
+        )
+        result = {
+            "ok": True,
+            "count": len(members_payload),
+            "max_slots": int(response.get("max_slots", config.get("max_slots", 20)) or 20) if isinstance(response, dict) else config.get("max_slots", 20),
+            "matched_medics": int(response.get("matched_medics", 0) or 0) if isinstance(response, dict) else 0,
+            "wordpress": response,
+        }
+        print(
+            "🏥 In-game Medical Corp sync:",
+            f"{result['count']}/{result['max_slots']} slots",
+            f"matched-profiles={result['matched_medics']}",
+        )
+        return result
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+        return {"ok": False, "message": f"WordPress HTTP {e.code}: {body[:500]}"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+
+async def wordpress_org_worker():
+    while not bot.is_closed():
+        try:
+            result = await sync_ingame_org_once()
+            if not result.get("ok") and not result.get("skipped"):
+                print(f"⚠️ In-game Medical Corp sync failed: {result.get('message','Unknown error')}")
+        except Exception as e:
+            print(f"⚠️ In-game Medical Corp worker error: {e}")
+        await asyncio.sleep(WORDPRESS_ORG_SYNC_SECONDS)
+
+
 # ================= WORDPRESS -> DISCORD NOTIFICATIONS =================
 def wordpress_notification_configured() -> bool:
     return bool(WORDPRESS_NOTIFICATION_URL and WORDPRESS_NOTIFICATION_ACK_URL and WORDPRESS_SYNC_SECRET)
@@ -960,7 +1092,7 @@ def _wordpress_json_request(url: str, method: str = "GET", payload=None, timeout
             "Content-Type": "application/json",
             "Accept": "application/json",
             "X-LVMC-Sync-Secret": WORDPRESS_SYNC_SECRET,
-            "User-Agent": "LVMC-MedBot/3.1",
+            "User-Agent": "LVMC-MedBot/3.3",
         },
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -1087,6 +1219,7 @@ async def wordpress_notification_worker():
 
 
 _notification_worker_task = None
+_org_worker_task = None
 
 # ================= REPORT EDIT HELPERS =================
 def parse_report_duration_to_minutes(duration_value) -> int:
@@ -1189,6 +1322,7 @@ async def rebuild_after_report_change():
 # ================= DISCORD BOT =================
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # Required to sync everyone who holds the in-game Medical Corp role.
 
 bot = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(bot)
@@ -1370,17 +1504,46 @@ async def syncwebsite(interaction: discord.Interaction):
 
     result = await asyncio.to_thread(push_wordpress_sync)
     if not result.get("ok"):
-        await interaction.followup.send(f"⚠️ Website sync failed/skipped: {result.get('message','Unknown error')}")
+        await interaction.followup.send(f"⚠️ Website stats sync failed/skipped: {result.get('message','Unknown error')}")
         return
 
+    org_result = await sync_ingame_org_once()
     wp = result.get("wordpress", {}) if isinstance(result.get("wordpress"), dict) else {}
+    org_line = (
+        f"• In-game organization: **{org_result.get('count',0)}/{org_result.get('max_slots',20)}**"
+        if org_result.get("ok")
+        else f"• In-game organization: ⚠️ {org_result.get('message','not synced')}"
+    )
     await interaction.followup.send(
         "✅ Website sync complete.\n"
         f"• Sent from Master Log: **{result.get('sent',0)}**\n"
         f"• WordPress matched: **{wp.get('matched','?')}**\n"
         f"• WordPress unmatched: **{len(wp.get('unmatched',[])) if isinstance(wp.get('unmatched'),list) else '?'}**\n"
-        f"• Master rows without Discord ID: **{len(result.get('without_discord_id',[]))}**"
+        f"• Master rows without Discord ID: **{len(result.get('without_discord_id',[]))}**\n"
+        + org_line
     )
+
+
+
+@tree.command(name="syncorg", description="Sync the in-game Medical Corp Discord role to the website")
+@discord.app_commands.guilds(discord.Object(id=GUILD_ID))
+async def syncorg(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("🚫 Admins only.", ephemeral=True)
+        return
+    result = await sync_ingame_org_once()
+    if result.get("ok"):
+        await interaction.followup.send(
+            f"🏥 In-game Medical Corp synced: **{result.get('count',0)}/{result.get('max_slots',20)}** slots filled. "
+            f"**{result.get('matched_medics',0)}** members matched to website Medic profiles.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            f"⚠️ In-game organization sync failed: {result.get('message','Unknown error')}",
+            ephemeral=True,
+        )
 
 
 @tree.command(name="portalstatus", description="Check WordPress portal sync and Discord notification delivery")
@@ -1392,9 +1555,11 @@ async def portalstatus(interaction: discord.Interaction):
         return
 
     notify = await asyncio.to_thread(wordpress_notification_status)
+    org = await asyncio.to_thread(wordpress_org_status)
     sync_ready = bool(WORDPRESS_SYNC_URL and WORDPRESS_SYNC_SECRET)
     lines = [
         f"**Stats sync configured:** {'✅' if sync_ready else '❌'}",
+        f"**In-game org sync:** {'✅' if org.get('configured') and org.get('role_id') else '❌'}",
         f"**Discord notification polling:** {'✅' if notify.get('configured') else '❌'}",
         f"**Notification endpoint:** `{notify.get('url', '(not configured)')}`",
     ]
@@ -1404,6 +1569,12 @@ async def portalstatus(interaction: discord.Interaction):
     else:
         lines.append("**Endpoint reachable:** ❌")
         lines.append(f"**Error:** `{str(notify.get('error','Unknown error'))[:500]}`")
+    if org.get("ok"):
+        lines.append(f"**In-game organization snapshot:** {org.get('current_count',0)}/{org.get('max_slots',20)}")
+        if not org.get("role_id"):
+            lines.append("**Organization role:** Not configured in LVMC Portal")
+    elif org.get("configured"):
+        lines.append(f"**Organization sync error:** `{str(org.get('error','Unknown error'))[:300]}`")
     if WORDPRESS_NOTIFICATION_CHANNEL_ID:
         lines.append(f"**DM fallback channel:** <#{WORDPRESS_NOTIFICATION_CHANNEL_ID}>")
     else:
@@ -2029,13 +2200,19 @@ async def on_ready():
     print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
     print(f"Logged in as {bot.user}")
 
-    global _notification_worker_task
+    global _notification_worker_task, _org_worker_task
     if wordpress_notification_configured() and (_notification_worker_task is None or _notification_worker_task.done()):
         _notification_worker_task = asyncio.create_task(wordpress_notification_worker())
         print(f"🔔 WordPress Discord notifications enabled (poll every {WORDPRESS_NOTIFICATION_POLL_SECONDS}s)")
         print(f"🔗 Notification endpoint: {WORDPRESS_NOTIFICATION_URL}")
     elif not wordpress_notification_configured():
         print("ℹ️ WordPress Discord notification polling is not configured.")
+
+    if wordpress_org_configured() and (_org_worker_task is None or _org_worker_task.done()):
+        _org_worker_task = asyncio.create_task(wordpress_org_worker())
+        print(f"🏥 In-game Medical Corp role sync enabled (every {WORDPRESS_ORG_SYNC_SECONDS}s)")
+    elif not wordpress_org_configured():
+        print("ℹ️ In-game Medical Corp role sync is not configured.")
 
 
 bot.run(DISCORD_TOKEN)
