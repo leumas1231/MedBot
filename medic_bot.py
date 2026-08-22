@@ -8,6 +8,7 @@ import threading
 import asyncio
 import urllib.request
 import urllib.error
+import html
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
@@ -15,6 +16,7 @@ from collections import defaultdict
 
 load_dotenv()
 
+# Portal notification formatting: v3.2
 # ================= CONFIG =================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = 1439473833273856120  # text channel if needed
@@ -1022,25 +1024,21 @@ async def deliver_wordpress_notification(item: dict) -> bool:
     except (TypeError, ValueError):
         return False
 
-    title = str(item.get("title", "LVMC Portal Update") or "LVMC Portal Update")[:200]
-    message = str(item.get("message", "") or "").strip()[:3000]
+    title = html.unescape(str(item.get("title", "LVMC update") or "LVMC update")).strip()[:200]
+    message = html.unescape(str(item.get("message", "") or "")).strip()[:3000]
     url = str(item.get("url", "") or "").strip()
     kind = str(item.get("kind", "general") or "general")
-    context = item.get("context", {}) if isinstance(item.get("context"), dict) else {}
     icons = {
-        "reply": "💬", "offer": "💰", "assignment": "⚕️", "status": "📌",
-        "completion": "✅", "medbot_report_prompt": "📋", "promotion": "🏅",
-        "new_request": "🚨",
+        "reply": "💬", "offer": "💰", "assignment": "💼", "status": "📌",
+        "completion": "✅", "promotion": "🏅", "new_request": "💰",
     }
     icon = icons.get(kind, "🔔")
-    body = f"{icon} **{title}**\n{message}"
-    if kind == "medbot_report_prompt":
-        body += "\n\n**Next step:** If this qualifies as a Medical Corps job, use `/report` in the Leaf server to log it."
-        compensation = str(context.get("compensation", "") or "").strip()
-        if compensation:
-            body += f"\n**Agreed terms:** {compensation}"
+    body = f"{icon} **{title}**"
+    if message:
+        body += f"\n{message}"
+    # Angle brackets suppress Discord's large link preview, keeping job DMs compact.
     if url:
-        body += f"\n\n🔗 {url}"
+        body += f"\n<{url}>"
 
     try:
         user = bot.get_user(discord_id) or await bot.fetch_user(discord_id)
