@@ -1004,18 +1004,27 @@ def _collect_recent_activity(records, known_ids, limit: int = 8):
 
 
 def build_wordpress_sync_payload():
-    """Build one batch payload with lifetime totals plus the current month's leaderboard stats."""
+    """Build one batch payload with lifetime, current-month, and previous-month stats."""
     master = SS.worksheet("Leaf Master Medical Log")
     records = get_master_records_cached(master, force=True)
     raw_records = get_raw_records_cached(force=True)
 
     now = datetime.now()
     monthly_period = now.strftime("%Y-%m")
+    previous_date = now.replace(day=1) - timedelta(days=1)
+    previous_month_period = previous_date.strftime("%Y-%m")
+
     rank_by_identity, _master_display, known_ids = _load_rank_identity_maps(raw_records)
     monthly_raw, monthly_jobs, _monthly_display = _collect_monthly_stats(
         raw_records, now.year, now.month, known_ids
     )
     monthly_hours = _collect_monthly_hours(raw_records, now.year, now.month, known_ids)
+    previous_raw, previous_jobs, _previous_display = _collect_monthly_stats(
+        raw_records, previous_date.year, previous_date.month, known_ids
+    )
+    previous_hours = _collect_monthly_hours(
+        raw_records, previous_date.year, previous_date.month, known_ids
+    )
     recent_activity = _collect_recent_activity(raw_records, known_ids, limit=8)
 
     medics = []
@@ -1037,6 +1046,11 @@ def build_wordpress_sync_payload():
         month_adjusted_points = month_raw_points * bonus_from_rank(sheet_rank)
         month_hours = round(monthly_hours.get(identity_key, 0.0), 2)
 
+        previous_raw_points = previous_raw.get(identity_key, 0)
+        previous_jobs_count = previous_jobs.get(identity_key, 0)
+        previous_adjusted_points = previous_raw_points * bonus_from_rank(sheet_rank)
+        previous_hours_count = round(previous_hours.get(identity_key, 0.0), 2)
+
         medics.append({
             "discord_id": discord_id,
             "medic_name": medic_name,
@@ -1052,6 +1066,13 @@ def build_wordpress_sync_payload():
                 "adjusted_points": round(month_adjusted_points, 2),
                 "jobs": month_jobs,
                 "hours": month_hours,
+            },
+            "previous_month": {
+                "period": previous_month_period,
+                "raw_points": previous_raw_points,
+                "adjusted_points": round(previous_adjusted_points, 2),
+                "jobs": previous_jobs_count,
+                "hours": previous_hours_count,
             },
             "total_clients": row.get("Total Clients", 0) or 0,
             "raid_defense_count": row.get("Raid/Defense Count", 0) or 0,
@@ -1076,6 +1097,7 @@ def build_wordpress_sync_payload():
         "source": "medbot",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "current_month_period": monthly_period,
+        "previous_month_period": previous_month_period,
         "medics": medics,
     }, skipped_without_id
 
@@ -1759,7 +1781,7 @@ tree = discord.app_commands.CommandTree(bot)
 
 
 # ================= COMMANDS =================
-# Command interface consolidated in MedBot v3.7.
+# Command interface consolidated in MedBot v3.7. Previous-month website stats added in v3.8.
 @tree.command(
     name="setrank",
     description="Ranks are controlled by Discord roles"
