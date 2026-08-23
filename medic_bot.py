@@ -576,6 +576,34 @@ def _collect_monthly_stats(records, year: int, month: int, known_ids):
     return points_by_identity, jobs_by_identity, display_by_identity
 
 
+
+def _collect_monthly_hours(records, year: int, month: int, known_ids):
+    """Collect service hours for the requested month using the same stable medic identities."""
+    hours_by_identity = defaultdict(float)
+
+    for row in records:
+        date_str = str(row.get("Report Date", "") or "").strip()
+        if not date_str:
+            continue
+        try:
+            d = datetime.strptime(date_str, "%m/%d/%Y")
+        except ValueError:
+            continue
+        if d.year != year or d.month != month:
+            continue
+
+        duration_text = str(row.get("Duration", "0") or "0")
+        match = re.search(r"\d+", duration_text)
+        minutes = int(match.group(0)) if match else 0
+        hours = minutes / 60.0
+
+        for medic_name, discord_id in report_medic_pairs(row):
+            key = medic_identity_key(medic_name, discord_id, known_ids)
+            hours_by_identity[key] += hours
+
+    return hours_by_identity
+
+
 def update_leaderboard():
     records = get_raw_records_cached()
     now = datetime.now()
@@ -939,9 +967,19 @@ def wordpress_sync_configured() -> bool:
 
 
 def build_wordpress_sync_payload():
-    """Build one batch payload from the lifetime Master Medical Log."""
+    """Build one batch payload with lifetime totals plus the current month's leaderboard stats."""
     master = SS.worksheet("Leaf Master Medical Log")
     records = get_master_records_cached(master, force=True)
+    raw_records = get_raw_records_cached(force=True)
+
+    now = datetime.now()
+    monthly_period = now.strftime("%Y-%m")
+    rank_by_identity, _master_display, known_ids = _load_rank_identity_maps(raw_records)
+    monthly_raw, monthly_jobs, _monthly_display = _collect_monthly_stats(
+        raw_records, now.year, now.month, known_ids
+    )
+    monthly_hours = _collect_monthly_hours(raw_records, now.year, now.month, known_ids)
+
     medics = []
     skipped_without_id = []
 
@@ -954,14 +992,28 @@ def build_wordpress_sync_payload():
             skipped_without_id.append(medic_name)
             continue
 
+        identity_key = medic_identity_key(medic_name, discord_id, known_ids)
+        sheet_rank = str(row.get("Rank", "Unranked") or "Unranked")
+        month_raw_points = monthly_raw.get(identity_key, 0)
+        month_jobs = monthly_jobs.get(identity_key, 0)
+        month_adjusted_points = month_raw_points * bonus_from_rank(sheet_rank)
+        month_hours = round(monthly_hours.get(identity_key, 0.0), 2)
+
         medics.append({
             "discord_id": discord_id,
             "medic_name": medic_name,
-            "sheet_rank": str(row.get("Rank", "Unranked") or "Unranked"),
+            "sheet_rank": sheet_rank,
             "total_jobs": row.get("Total Jobs", 0) or 0,
             "raw_points": row.get("Total Raw Points", 0) or 0,
             "adjusted_points": row.get("Total Adjusted Points", 0) or 0,
             "total_hours": row.get("Total Hours", 0) or 0,
+            "current_month": {
+                "period": monthly_period,
+                "raw_points": month_raw_points,
+                "adjusted_points": round(month_adjusted_points, 2),
+                "jobs": month_jobs,
+                "hours": month_hours,
+            },
             "total_clients": row.get("Total Clients", 0) or 0,
             "raid_defense_count": row.get("Raid/Defense Count", 0) or 0,
             "hosted_event_count": row.get("Hosted Event Count", 0) or 0,
@@ -983,6 +1035,7 @@ def build_wordpress_sync_payload():
     return {
         "source": "medbot",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "current_month_period": monthly_period,
         "medics": medics,
     }, skipped_without_id
 
