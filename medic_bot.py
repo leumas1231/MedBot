@@ -16,7 +16,7 @@ from collections import defaultdict
 
 load_dotenv()
 
-# Portal notification formatting + in-game org sync: v3.3
+# Portal notification formatting + in-game org sync: v3.4
 # ================= CONFIG =================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = 1439473833273856120  # text channel if needed
@@ -182,21 +182,119 @@ def ensure_reports_sheet_shape():
 
 
 def ensure_master_sheet_shape():
-    """Add/refresh Master Log headers without deleting existing medic data or ranks."""
+    """
+    Safely ensure the Master Log has the canonical A:W header row.
+
+    Important:
+    - If row 1 is already a header row, refresh it in place.
+    - If row 1 contains actual medic data, INSERT a new row above it so no
+      medic data is overwritten.
+    - If row 1 is blank, simply write the headers there.
+    """
     try:
         master = SS.worksheet("Leaf Master Medical Log")
         master.resize(cols=len(MASTER_HEADERS))
-        master.update("A1:W1", [MASTER_HEADERS])
+
+        first_row_values = master.get("A1:W1")
+        first_row = first_row_values[0] if first_row_values else []
+        padded = list(first_row[:len(MASTER_HEADERS)])
+        if len(padded) < len(MASTER_HEADERS):
+            padded.extend([""] * (len(MASTER_HEADERS) - len(padded)))
+
+        first_cell = str(padded[0] or "").strip()
+        second_cell = str(padded[1] or "").strip()
+        normalized_first = first_cell.lower()
+        normalized_second = second_cell.lower()
+
+        header_names_lower = {str(h).strip().lower() for h in MASTER_HEADERS}
+        header_hits = sum(
+            1 for value in padded
+            if str(value or "").strip().lower() in header_names_lower
+        )
+        looks_like_header = normalized_first == "medic" or header_hits >= 3
+
+        known_rank_values = {
+            "unranked",
+            "intern medic",
+            "field",
+            "field medic",
+            "junior",
+            "junior medic",
+            "senior",
+            "senior medic",
+            "paramedic",
+            "doctor",
+        }
+        looks_like_data = bool(first_cell) and normalized_second in known_rank_values
+
+        if looks_like_header:
+            master.update("A1:W1", [MASTER_HEADERS])
+            print("✅ Master Log header row refreshed.")
+        elif looks_like_data:
+            master.insert_row(
+                MASTER_HEADERS,
+                index=1,
+                value_input_option="USER_ENTERED",
+            )
+            print("🛠️ Master Log headers were missing; inserted a new header row without overwriting medic data.")
+        elif not any(str(v or "").strip() for v in padded):
+            master.update("A1:W1", [MASTER_HEADERS])
+            print("✅ Master Log header row created.")
+        else:
+            raise RuntimeError(
+                "Leaf Master Medical Log row 1 is neither a recognizable header nor a recognizable medic data row. "
+                "No automatic header repair was performed."
+            )
+
+        invalidate_master_cache()
+
     except gspread.exceptions.WorksheetNotFound:
         pass
 
 
+def _column_letter(column_number: int) -> str:
+    """Convert a 1-based column number to an A1-style column letter."""
+    result = ""
+    n = int(column_number)
+    while n > 0:
+        n, remainder = divmod(n - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
 def get_records_with_expected_headers(ws, expected_headers):
     """
-    Read records safely even if Google Sheets visually shows extra empty columns.
-    This prevents gspread duplicate blank header errors like duplicates: [''].
+    Read a fixed-width worksheet without relying on gspread's strict
+    ``expected_headers`` validation.
+
+    The bot owns the physical column layout for Reports and the Master Log,
+    so each value is mapped by column position to ``expected_headers``. This
+    keeps reads working if Google Sheets/gspread temporarily sees stale, blank,
+    duplicated, or partially-updated header metadata. The header row itself is
+    ignored for mapping; the canonical header list in the bot is authoritative.
     """
-    return ws.get_all_records(expected_headers=expected_headers)
+    if not expected_headers:
+        return []
+
+    end_col = _column_letter(len(expected_headers))
+    values = ws.get(f"A1:{end_col}")
+    if not values or len(values) <= 1:
+        return []
+
+    records = []
+    width = len(expected_headers)
+    for raw_row in values[1:]:
+        row = list(raw_row[:width])
+        if len(row) < width:
+            row.extend([""] * (width - len(row)))
+
+        # Ignore completely blank rows.
+        if not any(str(value).strip() for value in row):
+            continue
+
+        records.append(dict(zip(expected_headers, row)))
+
+    return records
 
 
 # ================= API READ CACHING (QUOTA FIX) =================
@@ -809,7 +907,11 @@ def set_rank_in_master_log(medic_name: str, rank: str) -> str:
 
 def link_medic_discord_id(medic_name: str, discord_id: int) -> str:
     """Link an existing/legacy Master Log medic name to a stable Discord ID."""
+    # Refresh the canonical A:W header row before reading. This is safe for
+    # existing data and prevents stale sheet headers from blocking /linkmedic.
+    ensure_master_sheet_shape()
     master = SS.worksheet("Leaf Master Medical Log")
+    invalidate_master_cache()
     records = get_master_records_cached(master, force=True)
     name_map = load_medic_normalization()
     medic = normalize_medic_name(medic_name.strip(), name_map)
@@ -1092,7 +1194,7 @@ def _wordpress_json_request(url: str, method: str = "GET", payload=None, timeout
             "Content-Type": "application/json",
             "Accept": "application/json",
             "X-LVMC-Sync-Secret": WORDPRESS_SYNC_SECRET,
-            "User-Agent": "LVMC-MedBot/3.3",
+            "User-Agent": "LVMC-MedBot/3.4",
         },
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
