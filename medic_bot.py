@@ -968,6 +968,41 @@ def wordpress_sync_configured() -> bool:
     return bool(WORDPRESS_SYNC_URL and WORDPRESS_SYNC_SECRET)
 
 
+def _report_url(value) -> str:
+    text = str(value or "")
+    match = re.search(r'https://discord\\.com/channels/[^"\\s)]+', text)
+    return match.group(0) if match else (text if text.startswith("https://") else "")
+
+
+def _collect_recent_activity(records, known_ids, limit: int = 8):
+    """Collect each linked Medic's most recent raw reports for website profiles."""
+    out = defaultdict(list)
+    for row in reversed(records):
+        for medic_name, discord_id in report_medic_pairs(row):
+            key = medic_identity_key(medic_name, discord_id, known_ids)
+            if len(out[key]) >= limit:
+                continue
+            points = row.get("Points", 0) or 0
+            try:
+                points = float(points)
+            except (TypeError, ValueError):
+                points = 0
+            clients = row.get("Clients", 0) or 0
+            try:
+                clients = int(float(clients))
+            except (TypeError, ValueError):
+                clients = 0
+            out[key].append({
+                "date": str(row.get("Report Date", "") or "").strip(),
+                "job": str(row.get("Job Name", "") or "").strip(),
+                "duration": str(row.get("Duration", "") or "").strip(),
+                "points": points,
+                "clients": clients,
+                "url": _report_url(row.get("Message Link", "")),
+            })
+    return out
+
+
 def build_wordpress_sync_payload():
     """Build one batch payload with lifetime totals plus the current month's leaderboard stats."""
     master = SS.worksheet("Leaf Master Medical Log")
@@ -981,6 +1016,7 @@ def build_wordpress_sync_payload():
         raw_records, now.year, now.month, known_ids
     )
     monthly_hours = _collect_monthly_hours(raw_records, now.year, now.month, known_ids)
+    recent_activity = _collect_recent_activity(raw_records, known_ids, limit=8)
 
     medics = []
     skipped_without_id = []
@@ -1033,6 +1069,7 @@ def build_wordpress_sync_payload():
             "hosted_event_hours": row.get("Hosted Event", 0) or 0,
             "host_training_hours": row.get("Host Training Event", 0) or 0,
             "training_participation_hours": row.get("Participate In Training Event", 0) or 0,
+            "recent_activity": recent_activity.get(identity_key, []),
         })
 
     return {
@@ -1722,6 +1759,7 @@ tree = discord.app_commands.CommandTree(bot)
 
 
 # ================= COMMANDS =================
+# Command interface consolidated in MedBot v3.7.
 @tree.command(
     name="setrank",
     description="Ranks are controlled by Discord roles"
@@ -1734,7 +1772,7 @@ async def setrank(interaction: discord.Interaction):
         return
     await interaction.followup.send(
         "ℹ️ Medic ranks are now controlled by **Discord roles**.\n"
-        "Change the Medic's Discord rank role, then use `/syncranks` if you want an immediate update."
+        "Change the Medic's Discord rank role, then use `/medadmin sync` → **Discord ranks** if you want an immediate update."
     )
 
 
@@ -1795,7 +1833,7 @@ async def linkmedic(
             else " Rank sync could not run yet."
         )
         await interaction.followup.send(
-            f"✅ {msg}{rank_note}\nRun `/updatelogs` only if you also need to rebuild older legacy report identity data."
+            f"✅ {msg}{rank_note}\nUse `/medadmin sync` with **Full Rebuild** only if you also need to rebuild older legacy report identity data."
         )
     except Exception as e:
         await interaction.followup.send(f"⚠️ Error linking medic: {e}")
@@ -2123,7 +2161,7 @@ async def myreports(interaction: discord.Interaction):
 
         if not reports:
             await interaction.followup.send(
-                "I could not find any editable reports for you. Only new reports submitted after this update will show here.",
+                "I could not find any editable reports for you. Only reports with stored reporter IDs can be edited here.",
                 ephemeral=True,
             )
             return
@@ -2145,7 +2183,7 @@ async def myreports(interaction: discord.Interaction):
             )
 
         await interaction.followup.send(
-            "Use `/editreport report_id:` with one of these Report IDs:\n\n" + "\n".join(lines),
+            "Use `/reports edit report_id:` with one of these Report IDs:\n\n" + "\n".join(lines),
             ephemeral=True,
         )
 
@@ -2154,14 +2192,14 @@ async def myreports(interaction: discord.Interaction):
 
 
 @tree.command(name="editreport", description="Edit one of your medic reports by Report ID")
-@discord.app_commands.describe(report_id="Use /myreports to find the Report ID")
+@discord.app_commands.describe(report_id="Use /reports recent to find the Report ID")
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
 async def editreport(interaction: discord.Interaction, report_id: str):
     row_number, existing_row = find_report_row_by_message_id(report_id)
 
     if row_number is None or existing_row is None:
         await interaction.response.send_message(
-            "❌ I could not find that report. Use `/myreports` to get the correct Report ID.",
+            "❌ I could not find that report. Use `/reports recent` to get the correct Report ID.",
             ephemeral=True,
         )
         return
@@ -2393,6 +2431,288 @@ async def editreport(interaction: discord.Interaction, report_id: str):
         view=EditReportView(),
         ephemeral=True,
     )
+
+
+
+# ================= GROUPED COMMAND INTERFACE (v3.7) =================
+# These groups keep the Discord command picker small while reusing the
+# already-tested command callbacks and sync functions above.
+
+reports_group = discord.app_commands.Group(
+    name="reports",
+    description="View or edit your Medic reports",
+)
+
+medic_group = discord.app_commands.Group(
+    name="medic",
+    description="Medic information and statistics",
+)
+
+medadmin_group = discord.app_commands.Group(
+    name="medadmin",
+    description="Medical Corps administration and synchronization",
+)
+
+
+@reports_group.command(name="recent", description="View your recent editable Medic reports")
+async def reports_recent(interaction: discord.Interaction):
+    await myreports.callback(interaction)
+
+
+@reports_group.command(name="edit", description="Edit one of your Medic reports")
+@discord.app_commands.describe(report_id="Use /reports recent to find the Report ID")
+async def reports_edit(interaction: discord.Interaction, report_id: str):
+    await editreport.callback(interaction, report_id)
+
+
+@medic_group.command(name="stats", description="View a Medic's lifetime activity")
+@discord.app_commands.describe(name="The Medic's name")
+async def medic_stats_group(interaction: discord.Interaction, name: str):
+    await medicstats.callback(interaction, name)
+
+
+@medadmin_group.command(name="status", description="Check portal, Discord, Sheets, and notification health")
+async def medadmin_status(interaction: discord.Interaction):
+    await portalstatus.callback(interaction)
+
+
+@medadmin_group.command(name="link", description="Link a Master Log Medic to a Discord member")
+@discord.app_commands.describe(
+    medic="Medic name exactly as it appears in the Master Medical Log",
+    member="The Discord member who owns this Medic profile",
+)
+async def medadmin_link(
+    interaction: discord.Interaction,
+    medic: str,
+    member: discord.Member,
+):
+    await linkmedic.callback(interaction, medic, member)
+
+
+@medadmin_group.command(name="sync", description="Synchronize Discord, Sheets, and/or the website")
+@discord.app_commands.describe(mode="Choose how much of the MedBot ecosystem to synchronize")
+@discord.app_commands.choices(
+    mode=[
+        discord.app_commands.Choice(name="All systems", value="all"),
+        discord.app_commands.Choice(name="Website stats", value="website"),
+        discord.app_commands.Choice(name="Discord ranks", value="ranks"),
+        discord.app_commands.Choice(name="In-game organization", value="organization"),
+        discord.app_commands.Choice(name="Full rebuild", value="full_rebuild"),
+    ]
+)
+async def medadmin_sync(
+    interaction: discord.Interaction,
+    mode: discord.app_commands.Choice[str],
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("🚫 Admins only.")
+        return
+
+    selected = mode.value
+
+    try:
+        if selected == "ranks":
+            result = await sync_discord_ranks_once()
+            if not result.get("ok"):
+                await interaction.followup.send(
+                    f"⚠️ Rank sync failed: {result.get('message', 'Unknown error')}"
+                )
+                return
+
+            await interaction.followup.send(
+                "🎖️ **Rank sync complete**\n"
+                f"• Linked medics checked: **{result.get('checked', 0)}**\n"
+                f"• Ranks changed: **{result.get('changed', 0)}**\n"
+                f"• Missing Discord IDs: **{result.get('without_discord_id', 0)}**\n"
+                f"• Missing configured rank role: **{result.get('without_rank_role', 0)}**"
+            )
+            return
+
+        if selected == "organization":
+            result = await sync_ingame_org_once()
+            if result.get("ok"):
+                await interaction.followup.send(
+                    "🏥 **In-game organization sync complete**\n"
+                    f"• Slots filled: **{result.get('count', 0)}/{result.get('max_slots', 20)}**\n"
+                    f"• Website Medic profiles matched: **{result.get('matched_medics', 0)}**"
+                )
+            else:
+                await interaction.followup.send(
+                    f"⚠️ Organization sync failed: {result.get('message', 'Unknown error')}"
+                )
+            return
+
+        if selected == "website":
+            if not wordpress_sync_configured():
+                await interaction.followup.send(
+                    "⚠️ Website sync is not configured on the VM."
+                )
+                return
+
+            result = await asyncio.to_thread(push_wordpress_sync)
+            if not result.get("ok"):
+                await interaction.followup.send(
+                    f"⚠️ Website sync failed: {result.get('message', 'Unknown error')}"
+                )
+                return
+
+            wp = result.get("wordpress", {}) if isinstance(result.get("wordpress"), dict) else {}
+            unmatched = wp.get("unmatched", [])
+            await interaction.followup.send(
+                "🌐 **Website stats sync complete**\n"
+                f"• Master Log medics sent: **{result.get('sent', 0)}**\n"
+                f"• WordPress matched: **{wp.get('matched', '?')}**\n"
+                f"• WordPress unmatched: **{len(unmatched) if isinstance(unmatched, list) else '?'}**\n"
+                f"• Master rows without Discord ID: **{len(result.get('without_discord_id', []))}**"
+            )
+            return
+
+        if selected == "all":
+            rank_result = await sync_discord_ranks_once(push_website=False)
+            if not rank_result.get("ok") and not rank_result.get("skipped"):
+                await interaction.followup.send(
+                    f"⚠️ Rank sync failed: {rank_result.get('message', 'Unknown error')}"
+                )
+                return
+
+            website_result = None
+            if wordpress_sync_configured():
+                website_result = await asyncio.to_thread(push_wordpress_sync)
+
+            org_result = await sync_ingame_org_once()
+
+            lines = ["✅ **All-system sync complete**"]
+            if rank_result.get("ok"):
+                lines.append(
+                    f"• Discord ranks: **{rank_result.get('changed', 0)} changed / "
+                    f"{rank_result.get('checked', 0)} checked**"
+                )
+            else:
+                lines.append("• Discord ranks: skipped")
+
+            if website_result and website_result.get("ok"):
+                wp = website_result.get("wordpress", {}) if isinstance(website_result.get("wordpress"), dict) else {}
+                lines.append(
+                    f"• Website: **{wp.get('matched', '?')} Medic profiles matched**"
+                )
+            elif wordpress_sync_configured():
+                lines.append("• Website: ⚠️ sync failed")
+            else:
+                lines.append("• Website: not configured")
+
+            if org_result.get("ok"):
+                lines.append(
+                    f"• In-game organization: **{org_result.get('count', 0)}/"
+                    f"{org_result.get('max_slots', 20)}**"
+                )
+            else:
+                lines.append("• In-game organization: ⚠️ sync failed")
+
+            await interaction.followup.send("\n".join(lines))
+            return
+
+        if selected == "full_rebuild":
+            # Rank first so all adjusted BP is rebuilt from the authoritative Discord rank.
+            rank_result = await sync_discord_ranks_once(push_website=False)
+            if not rank_result.get("ok") and not rank_result.get("skipped"):
+                await interaction.followup.send(
+                    f"⚠️ Rank sync failed before rebuild: {rank_result.get('message', 'Unknown error')}"
+                )
+                return
+
+            await asyncio.to_thread(get_raw_records_cached, True)
+            master_updated = bool(await asyncio.to_thread(update_master_log))
+            await asyncio.to_thread(update_all_leaderboards)
+
+            website_result = None
+            if wordpress_sync_configured():
+                website_result = await asyncio.to_thread(push_wordpress_sync)
+
+            org_result = await sync_ingame_org_once()
+
+            lines = [
+                "🛠️ **Full rebuild complete**",
+                f"• Master Log rebuilt: **{'Yes' if master_updated else 'No changes / safely skipped'}**",
+                "• Monthly leaderboard sheets rebuilt: **Yes**",
+            ]
+            if rank_result.get("ok"):
+                lines.append(
+                    f"• Discord ranks: **{rank_result.get('changed', 0)} changed**"
+                )
+
+            if website_result and website_result.get("ok"):
+                wp = website_result.get("wordpress", {}) if isinstance(website_result.get("wordpress"), dict) else {}
+                lines.append(f"• Website matched: **{wp.get('matched', '?')}**")
+            elif wordpress_sync_configured():
+                lines.append("• Website: ⚠️ sync failed")
+
+            if org_result.get("ok"):
+                lines.append(
+                    f"• In-game organization: **{org_result.get('count', 0)}/"
+                    f"{org_result.get('max_slots', 20)}**"
+                )
+
+            await interaction.followup.send("\n".join(lines))
+            return
+
+        await interaction.followup.send("⚠️ Unknown sync mode.")
+
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Sync error: {e}")
+
+
+@medadmin_group.command(name="leaderboard", description="Rebuild one month's leaderboard sheet")
+@discord.app_commands.describe(year="Year, e.g. 2026", month="Month number, 1-12")
+async def medadmin_leaderboard(
+    interaction: discord.Interaction,
+    year: int,
+    month: int,
+):
+    await rebuild_leaderboard.callback(interaction, year, month)
+
+
+@medadmin_group.command(name="ryo", description="Set the monthly Medic payout pool")
+@discord.app_commands.describe(
+    year="Year, e.g. 2026",
+    month="Month number, 1-12",
+    amount="Total Ryo for that month",
+)
+async def medadmin_ryo(
+    interaction: discord.Interaction,
+    year: int,
+    month: int,
+    amount: int,
+):
+    await set_ryo.callback(interaction, year, month, amount)
+
+
+# Register only the grouped replacements in the guild command picker.
+_guild = discord.Object(id=GUILD_ID)
+tree.add_command(reports_group, guild=_guild)
+tree.add_command(medic_group, guild=_guild)
+tree.add_command(medadmin_group, guild=_guild)
+
+# Remove the old top-level commands from Discord's visible command list.
+# Their Command objects remain available above so the grouped wrappers can reuse
+# the same callbacks without duplicating the tested command logic.
+for _legacy_command_name in (
+    "setrank",
+    "syncranks",
+    "linkmedic",
+    "updatelogs",
+    "rebuildleaderboard",
+    "setryo",
+    "syncwebsite",
+    "syncorg",
+    "portalstatus",
+    "medicstats",
+    "myreports",
+    "editreport",
+):
+    tree.remove_command(_legacy_command_name, guild=_guild)
+
 
 
 @tree.command(name="report", description="Submit a medic report")
