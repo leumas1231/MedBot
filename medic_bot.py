@@ -16,7 +16,7 @@ from collections import defaultdict
 
 load_dotenv()
 
-# Portal notification formatting + in-game org sync: v3.4
+# Portal notifications + in-game org + Discord-authoritative rank sync: v3.5
 # ================= CONFIG =================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = 1439473833273856120  # text channel if needed
@@ -31,9 +31,11 @@ if not WORDPRESS_NOTIFICATION_URL and WORDPRESS_SYNC_URL:
     WORDPRESS_NOTIFICATION_URL = WORDPRESS_SYNC_URL.rsplit("/", 1)[0] + "/discord-notifications"
 WORDPRESS_NOTIFICATION_ACK_URL = WORDPRESS_NOTIFICATION_URL.rstrip("/") + "/ack" if WORDPRESS_NOTIFICATION_URL else ""
 WORDPRESS_ORG_URL = WORDPRESS_SYNC_URL.rsplit("/", 1)[0] + "/medbot-org" if WORDPRESS_SYNC_URL else ""
+WORDPRESS_RANK_URL = WORDPRESS_SYNC_URL.rsplit("/", 1)[0] + "/medbot-ranks" if WORDPRESS_SYNC_URL else ""
 WORDPRESS_NOTIFICATION_POLL_SECONDS = max(30, int(os.getenv("LVMC_WORDPRESS_NOTIFICATION_POLL_SECONDS", "60") or 60))
 WORDPRESS_NOTIFICATION_CHANNEL_ID = int(os.getenv("LVMC_WORDPRESS_NOTIFICATION_CHANNEL_ID", "0") or 0)
 WORDPRESS_ORG_SYNC_SECONDS = max(60, int(os.getenv("LVMC_WORDPRESS_ORG_SYNC_SECONDS", "300") or 300))
+WORDPRESS_RANK_SYNC_SECONDS = max(60, int(os.getenv("LVMC_WORDPRESS_RANK_SYNC_SECONDS", "300") or 300))
 
 VALID_RANKS = [
     # Intern Medic is stored as "Unranked" in the medical spreadsheet.
@@ -1003,6 +1005,7 @@ def build_wordpress_sync_payload():
             "discord_id": discord_id,
             "medic_name": medic_name,
             "sheet_rank": sheet_rank,
+            "official_rank": sheet_rank,
             "total_jobs": row.get("Total Jobs", 0) or 0,
             "raw_points": row.get("Total Raw Points", 0) or 0,
             "adjusted_points": row.get("Total Adjusted Points", 0) or 0,
@@ -1101,6 +1104,240 @@ def push_wordpress_sync():
         return {"ok": False, "message": str(e)}
 
 
+
+
+# ================= DISCORD -> MASTER LOG / WORDPRESS RANK SYNC =================
+RANK_ORDER = [
+    ("Intern Medic", "Unranked"),
+    ("Field Medic", "Field Medic"),
+    ("Junior Medic", "Junior Medic"),
+    ("Senior Medic", "Senior Medic"),
+    ("Paramedic", "Paramedic"),
+    ("Doctor", "Doctor"),
+]
+_rank_sync_lock = asyncio.Lock()
+
+
+def wordpress_rank_configured() -> bool:
+    return bool(WORDPRESS_RANK_URL and WORDPRESS_SYNC_SECRET)
+
+
+def wordpress_rank_status():
+    if not wordpress_rank_configured():
+        return {
+            "ok": False,
+            "configured": False,
+            "url": WORDPRESS_RANK_URL or "(not configured)",
+            "error": "WordPress sync URL / secret are not fully configured.",
+        }
+    try:
+        data = _wordpress_json_request(WORDPRESS_RANK_URL, "GET")
+        return {
+            "ok": True,
+            "configured": True,
+            "url": WORDPRESS_RANK_URL,
+            "guild_id": str(data.get("guild_id", "") or ""),
+            "rank_roles": data.get("rank_roles", {}) if isinstance(data.get("rank_roles", {}), dict) else {},
+            "last_sync": data.get("last_sync", {}) if isinstance(data.get("last_sync", {}), dict) else {},
+        }
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+        return {"ok": False, "configured": True, "url": WORDPRESS_RANK_URL, "error": f"HTTP {e.code}: {body[:300]}"}
+    except Exception as e:
+        return {"ok": False, "configured": True, "url": WORDPRESS_RANK_URL, "error": str(e)}
+
+
+def _master_rank_links():
+    ensure_master_sheet_shape()
+    master = SS.worksheet("Leaf Master Medical Log")
+    invalidate_master_cache()
+    records = get_master_records_cached(master, force=True)
+
+    linked = []
+    without_id = 0
+    for sheet_row, row in enumerate(records, start=2):
+        medic_name = str(row.get("Medic", "") or "").strip()
+        if not medic_name:
+            continue
+        discord_id = clean_sheet_id(row.get("Discord ID", ""))
+        if not discord_id:
+            without_id += 1
+            continue
+        linked.append({
+            "sheet_row": sheet_row,
+            "medic_name": medic_name,
+            "discord_id": discord_id,
+            "sheet_rank": str(row.get("Rank", "Unranked") or "Unranked"),
+        })
+    return linked, without_id
+
+
+def _apply_master_rank_changes(changes):
+    if not changes:
+        return
+
+    data = [
+        {
+            "range": f"'Leaf Master Medical Log'!B{item['sheet_row']}",
+            "values": [[item["new_sheet_rank"]]],
+        }
+        for item in changes
+    ]
+    SS.values_batch_update({
+        "valueInputOption": "USER_ENTERED",
+        "data": data,
+    })
+    invalidate_master_cache()
+
+
+def _discord_rank_for_member(member, rank_roles):
+    member_role_ids = {str(role.id) for role in getattr(member, "roles", [])}
+    best = None
+
+    # Ascending order means a higher matching role replaces a lower one.
+    for public_rank, sheet_rank in RANK_ORDER:
+        configured = {
+            str(role_id).strip()
+            for role_id in (rank_roles.get(public_rank, []) or [])
+            if str(role_id).strip().isdigit()
+        }
+        if configured and member_role_ids.intersection(configured):
+            best = (public_rank, sheet_rank)
+
+    return best
+
+
+async def sync_discord_ranks_once(target_discord_ids=None, push_website=True):
+    if not wordpress_rank_configured():
+        return {"ok": False, "skipped": True, "message": "WordPress rank sync is not configured."}
+
+    async with _rank_sync_lock:
+        config = await asyncio.to_thread(wordpress_rank_status)
+        if not config.get("ok"):
+            return {"ok": False, "message": str(config.get("error", "Could not read WordPress rank settings."))}
+
+        rank_roles = config.get("rank_roles", {})
+        if not any(rank_roles.get(rank) for rank, _sheet_rank in RANK_ORDER):
+            return {
+                "ok": False,
+                "skipped": True,
+                "message": "No Discord Medic rank role IDs are configured in WordPress → LVMC Portal.",
+            }
+
+        try:
+            guild_id = int(str(config.get("guild_id", "") or GUILD_ID))
+        except ValueError:
+            return {"ok": False, "message": "WordPress returned an invalid Medical Corps Discord guild ID."}
+
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            return {"ok": False, "message": f"MedBot is not connected to Medical Corps Discord guild {guild_id}."}
+
+        links, without_id = await asyncio.to_thread(_master_rank_links)
+        targets = {str(x) for x in target_discord_ids} if target_discord_ids else None
+        if targets is not None:
+            links = [row for row in links if row["discord_id"] in targets]
+
+        changes = []
+        checked = 0
+        not_in_guild = 0
+        without_rank_role = 0
+
+        for row in links:
+            try:
+                discord_id_int = int(row["discord_id"])
+            except ValueError:
+                continue
+
+            member = guild.get_member(discord_id_int)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(discord_id_int)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    member = None
+
+            if member is None:
+                not_in_guild += 1
+                continue
+
+            checked += 1
+            detected = _discord_rank_for_member(member, rank_roles)
+            if not detected:
+                # Avoid destructive demotions if a role mapping is temporarily missing.
+                without_rank_role += 1
+                continue
+
+            public_rank, new_sheet_rank = detected
+            old_sheet_rank = str(row["sheet_rank"] or "Unranked")
+            normalized_old = {
+                "Field": "Field Medic",
+                "Junior": "Junior Medic",
+                "Senior": "Senior Medic",
+                "Intern Medic": "Unranked",
+            }.get(old_sheet_rank, old_sheet_rank)
+
+            if normalized_old != new_sheet_rank:
+                changes.append({
+                    **row,
+                    "public_rank": public_rank,
+                    "new_sheet_rank": new_sheet_rank,
+                })
+
+        if changes:
+            await asyncio.to_thread(_apply_master_rank_changes, changes)
+
+            # Rebuild lifetime adjusted totals from the new official ranks.
+            master_updated = await asyncio.to_thread(update_master_log)
+            if master_updated:
+                await asyncio.to_thread(update_leaderboard)
+
+        # Always push after a rank check. This also repairs stale WordPress ranks
+        # when the spreadsheet already had the correct value.
+        wp_result = None
+        if push_website and wordpress_sync_configured():
+            wp_result = await asyncio.to_thread(push_wordpress_sync)
+
+        summary = {
+            "checked": checked,
+            "changed": len(changes),
+            "without_discord_id": without_id,
+            "not_in_guild": not_in_guild,
+            "without_rank_role": without_rank_role,
+        }
+
+        try:
+            await asyncio.to_thread(_wordpress_json_request, WORDPRESS_RANK_URL, "POST", summary)
+        except Exception as e:
+            print(f"⚠️ Could not save Discord rank sync status to WordPress: {e}")
+
+        if changes:
+            printable = ", ".join(
+                f"{item['medic_name']}: {item['sheet_rank']} → {item['new_sheet_rank']}"
+                for item in changes[:10]
+            )
+            if len(changes) > 10:
+                printable += f", +{len(changes)-10} more"
+            print(f"🎖️ Discord rank sync changed {len(changes)} medic(s): {printable}")
+        else:
+            print(f"🎖️ Discord rank sync checked {checked} linked medic(s); no rank changes.")
+
+        return {
+            "ok": True,
+            **summary,
+            "changes": changes,
+            "wordpress": wp_result,
+        }
+
+
+async def wordpress_rank_worker():
+    while not bot.is_closed():
+        try:
+            result = await sync_discord_ranks_once()
+            if not result.get("ok") and not result.get("skipped"):
+                print(f"⚠️ Discord rank sync failed: {result.get('message','Unknown error')}")
+        except Exception as e:
+            print(f"⚠️ Discord rank worker error: {e}")
+        await asyncio.sleep(WORDPRESS_RANK_SYNC_SECONDS)
 
 
 # ================= IN-GAME MEDICAL CORP ORGANIZATION SYNC =================
@@ -1375,6 +1612,7 @@ async def wordpress_notification_worker():
 
 _notification_worker_task = None
 _org_worker_task = None
+_rank_worker_task = None
 
 # ================= REPORT EDIT HELPERS =================
 def parse_report_duration_to_minutes(duration_value) -> int:
@@ -1486,54 +1724,46 @@ tree = discord.app_commands.CommandTree(bot)
 # ================= COMMANDS =================
 @tree.command(
     name="setrank",
-    description="Set a medic's rank in the Master Medical Log (admin only)"
-)
-@discord.app_commands.describe(
-    medic="Medic name (case-insensitive)",
-    rank="Select the medic's rank"
-)
-@discord.app_commands.choices(
-    rank=[
-        discord.app_commands.Choice(name="Intern Medic", value="Unranked"),
-        discord.app_commands.Choice(name="Field Medic", value="Field Medic"),
-        discord.app_commands.Choice(name="Junior Medic", value="Junior Medic"),
-        discord.app_commands.Choice(name="Senior Medic", value="Senior Medic"),
-        discord.app_commands.Choice(name="Paramedic", value="Paramedic"),
-        discord.app_commands.Choice(name="Doctor", value="Doctor"),
-    ]
+    description="Ranks are controlled by Discord roles"
 )
 @discord.app_commands.guilds(discord.Object(id=GUILD_ID))
-async def setrank(
-    interaction: discord.Interaction,
-    medic: str,
-    rank: discord.app_commands.Choice[str],
-):
+async def setrank(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("🚫 Admins only.")
+        return
+    await interaction.followup.send(
+        "ℹ️ Medic ranks are now controlled by **Discord roles**.\n"
+        "Change the Medic's Discord rank role, then use `/syncranks` if you want an immediate update."
+    )
 
+
+@tree.command(
+    name="syncranks",
+    description="Sync Discord Medic ranks to Sheets and the website (admin only)"
+)
+@discord.app_commands.guilds(discord.Object(id=GUILD_ID))
+async def syncranks(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     if not interaction.user.guild_permissions.administrator:
         await interaction.followup.send("🚫 Admins only.")
         return
 
-    try:
-        msg = set_rank_in_master_log(medic, rank.value)
-
-        # Recalculate derived data immediately (throttled)
-        master_updated = False
-        if should_run("master"):
-            master_updated = bool(update_master_log())
-        if should_run("leaderboard"):
-            update_leaderboard()
-        sync_note = ""
-        if master_updated and wordpress_sync_configured():
-            sync_result = await asyncio.to_thread(push_wordpress_sync)
-            sync_note = "\nWebsite sync: **complete**" if sync_result.get("ok") else "\nWebsite sync: **failed/skipped**"
-
-        rank_label = "Intern Medic (stored as Unranked)" if rank.value == "Unranked" else rank.value
+    result = await sync_discord_ranks_once()
+    if not result.get("ok"):
         await interaction.followup.send(
-            f"✅ Rank set to **{rank_label}**.\nBonus applied: **×{bonus_from_rank(rank.value)}**{sync_note}"
+            f"⚠️ Rank sync failed: {result.get('message','Unknown error')}"
         )
-    except Exception as e:
-        await interaction.followup.send(f"⚠️ Error setting rank: {e}")
+        return
+
+    await interaction.followup.send(
+        "🎖️ **Discord rank sync complete**\n"
+        f"Linked medics checked: **{result.get('checked',0)}**\n"
+        f"Ranks changed: **{result.get('changed',0)}**\n"
+        f"Master rows without Discord ID: **{result.get('without_discord_id',0)}**\n"
+        f"Members not found in Med Corps Discord: **{result.get('not_in_guild',0)}**\n"
+        f"Linked members without a configured rank role: **{result.get('without_rank_role',0)}**"
+    )
 
 
 @tree.command(
@@ -1558,8 +1788,14 @@ async def linkmedic(
 
     try:
         msg = link_medic_discord_id(medic, member.id)
+        rank_result = await sync_discord_ranks_once(target_discord_ids={str(member.id)})
+        rank_note = (
+            f" Rank sync: **{rank_result.get('changed',0)} change(s)**."
+            if rank_result.get("ok")
+            else " Rank sync could not run yet."
+        )
         await interaction.followup.send(
-            f"✅ {msg}\nRun `/updatelogs` to merge legacy rows under that Discord identity."
+            f"✅ {msg}{rank_note}\nRun `/updatelogs` only if you also need to rebuild older legacy report identity data."
         )
     except Exception as e:
         await interaction.followup.send(f"⚠️ Error linking medic: {e}")
@@ -1570,6 +1806,9 @@ async def linkmedic(
 async def update_logs(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
+        # Discord is authoritative for rank before any adjusted BP rebuild.
+        await sync_discord_ranks_once(push_website=False)
+
         # force fresh cache reads for a manual rebuild
         get_raw_records_cached(force=True)
         master_updated = bool(update_master_log())
@@ -1657,6 +1896,13 @@ async def syncwebsite(interaction: discord.Interaction):
         )
         return
 
+    rank_result = await sync_discord_ranks_once(push_website=False)
+    if not rank_result.get("ok") and not rank_result.get("skipped"):
+        await interaction.followup.send(
+            f"⚠️ Discord rank sync failed before website sync: {rank_result.get('message','Unknown error')}"
+        )
+        return
+
     result = await asyncio.to_thread(push_wordpress_sync)
     if not result.get("ok"):
         await interaction.followup.send(f"⚠️ Website stats sync failed/skipped: {result.get('message','Unknown error')}")
@@ -1711,6 +1957,7 @@ async def portalstatus(interaction: discord.Interaction):
 
     notify = await asyncio.to_thread(wordpress_notification_status)
     org = await asyncio.to_thread(wordpress_org_status)
+    ranks = await asyncio.to_thread(wordpress_rank_status)
     sync_ready = bool(WORDPRESS_SYNC_URL and WORDPRESS_SYNC_SECRET)
     lines = [
         f"**Stats sync configured:** {'✅' if sync_ready else '❌'}",
@@ -1730,6 +1977,15 @@ async def portalstatus(interaction: discord.Interaction):
             lines.append("**Organization role:** Not configured in LVMC Portal")
     elif org.get("configured"):
         lines.append(f"**Organization sync error:** `{str(org.get('error','Unknown error'))[:300]}`")
+    if ranks.get("ok"):
+        configured_rank_roles = sum(
+            1 for rank_name, _sheet_rank in RANK_ORDER
+            if ranks.get("rank_roles", {}).get(rank_name)
+        )
+        lines.append(f"**Discord rank sync:** ✅ ({configured_rank_roles}/6 rank roles mapped)")
+    else:
+        lines.append(f"**Discord rank sync:** ❌ `{str(ranks.get('error','not configured'))[:300]}`")
+
     if WORDPRESS_NOTIFICATION_CHANNEL_ID:
         lines.append(f"**DM fallback channel:** <#{WORDPRESS_NOTIFICATION_CHANNEL_ID}>")
     else:
@@ -2344,6 +2600,26 @@ async def report(interaction: discord.Interaction):
 
 
 @bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """Update Sheets + WordPress immediately when a Medical Corps Discord role changes."""
+    if after.guild.id != GUILD_ID:
+        return
+
+    if {role.id for role in before.roles} == {role.id for role in after.roles}:
+        return
+
+    async def _sync_changed_member():
+        try:
+            result = await sync_discord_ranks_once(target_discord_ids={str(after.id)})
+            if result.get("ok") and result.get("changed"):
+                print(f"🎖️ Discord role change synchronized for {after}.")
+        except Exception as e:
+            print(f"⚠️ Rank sync after role change failed for {after}: {e}")
+
+    asyncio.create_task(_sync_changed_member())
+
+
+@bot.event
 async def on_ready():
     try:
         ensure_reports_sheet_shape()
@@ -2355,7 +2631,7 @@ async def on_ready():
     print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
     print(f"Logged in as {bot.user}")
 
-    global _notification_worker_task, _org_worker_task
+    global _notification_worker_task, _org_worker_task, _rank_worker_task
     if wordpress_notification_configured() and (_notification_worker_task is None or _notification_worker_task.done()):
         _notification_worker_task = asyncio.create_task(wordpress_notification_worker())
         print(f"🔔 WordPress Discord notifications enabled (poll every {WORDPRESS_NOTIFICATION_POLL_SECONDS}s)")
@@ -2368,6 +2644,16 @@ async def on_ready():
         print(f"🏥 In-game Medical Corp role sync enabled (every {WORDPRESS_ORG_SYNC_SECONDS}s)")
     elif not wordpress_org_configured():
         print("ℹ️ In-game Medical Corp role sync is not configured.")
+
+
+    if wordpress_rank_configured() and (_rank_worker_task is None or _rank_worker_task.done()):
+        _rank_worker_task = asyncio.create_task(wordpress_rank_worker())
+        print(
+            f"🎖️ Discord Medic rank sync enabled "
+            f"(every {WORDPRESS_RANK_SYNC_SECONDS}s + immediate role-change events)"
+        )
+    elif not wordpress_rank_configured():
+        print("ℹ️ Discord Medic rank sync is not configured.")
 
 
 bot.run(DISCORD_TOKEN)
