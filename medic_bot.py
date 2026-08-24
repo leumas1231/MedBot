@@ -128,9 +128,12 @@ JOB_OPTIONS = [
 ]
 
 
-# ================= RYO (PER-MONTH) =================
+# ================= RYO / PAYOUT ELIGIBILITY (PER-MONTH) =================
 RYO_FILE = "monthly_ryo.json"
-monthly_ryo = {}  # {"2026-01": 25000, ...}
+# Backward compatible formats:
+#   Legacy: {"2026-08": 25000}
+#   v3.9+:  {"2026-08": {"pool": 25000, "opted_out": ["123456789..."]}}
+monthly_ryo = {}
 DEFAULT_RYO = 25000  # fallback if month not set
 
 
@@ -155,11 +158,80 @@ def get_month_key(year: int, month: int) -> str:
     return f"{year}-{month:02d}"
 
 
+def _get_month_payout_config(year: int, month: int) -> dict:
+    """Return normalized payout config without mutating legacy JSON entries."""
+    key = get_month_key(year, month)
+    value = monthly_ryo.get(key, DEFAULT_RYO)
+
+    if isinstance(value, dict):
+        try:
+            pool = int(value.get("pool", DEFAULT_RYO))
+        except (TypeError, ValueError):
+            pool = DEFAULT_RYO
+
+        opted_out = []
+        for discord_id in value.get("opted_out", []) or []:
+            did = clean_sheet_id(discord_id)
+            if did and did not in opted_out:
+                opted_out.append(did)
+
+        return {"pool": pool, "opted_out": opted_out}
+
+    try:
+        pool = int(value)
+    except (TypeError, ValueError):
+        pool = DEFAULT_RYO
+
+    return {"pool": pool, "opted_out": []}
+
+
+def _save_month_payout_config(year: int, month: int, *, pool=None, opted_out=None):
+    """Write the new structured format while preserving unspecified values."""
+    current = _get_month_payout_config(year, month)
+
+    if pool is not None:
+        current["pool"] = int(pool)
+
+    if opted_out is not None:
+        current["opted_out"] = sorted({
+            clean_sheet_id(discord_id)
+            for discord_id in opted_out
+            if clean_sheet_id(discord_id)
+        })
+
+    monthly_ryo[get_month_key(year, month)] = current
+    save_monthly_ryo()
+    return current
+
+
 def get_bank_ryo(year: int, month: int) -> int:
-    return int(monthly_ryo.get(get_month_key(year, month), DEFAULT_RYO))
+    return int(_get_month_payout_config(year, month)["pool"])
 
 
-# Load on startup so /setryo persists across restarts
+def get_payout_optouts(year: int, month: int) -> set:
+    """Discord IDs that declined payment for this month."""
+    return set(_get_month_payout_config(year, month)["opted_out"])
+
+
+def set_bank_ryo(year: int, month: int, amount: int):
+    return _save_month_payout_config(year, month, pool=amount)
+
+
+def set_medic_payout_eligibility(year: int, month: int, discord_id, eligible: bool):
+    did = clean_sheet_id(discord_id)
+    if not did:
+        raise ValueError("A valid Discord ID is required.")
+
+    opted_out = get_payout_optouts(year, month)
+    if eligible:
+        opted_out.discard(did)
+    else:
+        opted_out.add(did)
+
+    return _save_month_payout_config(year, month, opted_out=opted_out)
+
+
+# Load on startup so payout settings persist across restarts.
 load_monthly_ryo()
 
 # ================= GOOGLE SHEETS AUTH =================
@@ -457,6 +529,94 @@ def member_display_name(member) -> str:
     )
 
 
+def linked_medic_for_discord_id(discord_id: int):
+    """Return a linked Master Log Medic row for a Discord member, or None."""
+    did = clean_sheet_id(discord_id)
+    try:
+        master = SS.worksheet("Leaf Master Medical Log")
+        records = get_master_records_cached(master, force=True)
+    except gspread.exceptions.WorksheetNotFound:
+        return None
+
+    for row in records:
+        row_id = clean_sheet_id(row.get("Discord ID", ""))
+        if row_id and row_id == did:
+            return row
+    return None
+
+
+def _identity_discord_id(identity_key: str) -> str:
+    """Extract a Discord ID from an id:123 identity key."""
+    if str(identity_key).startswith("id:"):
+        return clean_sheet_id(str(identity_key)[3:])
+    return ""
+
+
+def calculate_monthly_payout_snapshot(year: int, month: int) -> dict:
+    """
+    Calculate payout-only data for a month.
+
+    Medical activity is never removed. Opted-out Medics keep their BP/jobs/rank
+    exactly as normal; only the payout denominator excludes them.
+    """
+    records = get_raw_records_cached()
+    bank_ryo = get_bank_ryo(year, month)
+    opted_out_ids = get_payout_optouts(year, month)
+
+    rank_by_identity, master_display, known_ids = _load_rank_identity_maps(records)
+    points_by_identity, jobs_by_identity, report_display = _collect_monthly_stats(
+        records, year, month, known_ids
+    )
+
+    adjusted = {}
+    for key, raw_pts in points_by_identity.items():
+        rank = rank_by_identity.get(key, "Unranked")
+        adjusted[key] = raw_pts * bonus_from_rank(rank)
+
+    eligible_adjusted_total = 0.0
+    for key, adj in adjusted.items():
+        did = _identity_discord_id(key)
+        if did and did in opted_out_ids:
+            continue
+        eligible_adjusted_total += adj
+
+    rows = []
+    for key in sorted(adjusted, key=adjusted.get, reverse=True):
+        medic = report_display.get(key) or master_display.get(key) or key
+        did = _identity_discord_id(key)
+        opted_out = bool(did and did in opted_out_ids)
+        adj = adjusted[key]
+
+        if opted_out:
+            pay = 0.0
+        else:
+            share = adj / eligible_adjusted_total if eligible_adjusted_total > 0 else 0
+            pay = round(share * bank_ryo, 2)
+
+        rows.append({
+            "identity": key,
+            "discord_id": did,
+            "medic": medic,
+            "raw_points": points_by_identity[key],
+            "adjusted_points": adj,
+            "jobs": jobs_by_identity[key],
+            "rank": rank_by_identity.get(key, "Unranked"),
+            "opted_out": opted_out,
+            "pay": pay,
+        })
+
+    return {
+        "year": year,
+        "month": month,
+        "pool": bank_ryo,
+        "opted_out_ids": opted_out_ids,
+        "eligible_adjusted_total": eligible_adjusted_total,
+        "rows": rows,
+        "eligible_count": sum(1 for row in rows if not row["opted_out"]),
+        "opted_out_count": sum(1 for row in rows if row["opted_out"]),
+    }
+
+
 # ================= POINT CALCULATOR =================
 def calculate_points(job_name: str, duration: int, clients: int) -> int:
     job_name = job_name.lower().strip()
@@ -639,7 +799,12 @@ def update_leaderboard():
         rank = rank_by_identity.get(key, "Unranked")
         adjusted_points[key] = raw * bonus_from_rank(rank)
 
-    total_adjusted = sum(adjusted_points.values())
+    opted_out_ids = get_payout_optouts(current_year, current_month)
+    eligible_adjusted = sum(
+        adj for key, adj in adjusted_points.items()
+        if _identity_discord_id(key) not in opted_out_ids
+    )
+
     sorted_keys = sorted(adjusted_points, key=adjusted_points.get, reverse=True)
     output = [LEADERBOARD_HEADERS]
     return_data = []
@@ -652,8 +817,14 @@ def update_leaderboard():
         rank_title = rank_by_identity.get(key, "Unranked")
         mult = bonus_from_rank(rank_title)
         adj = adjusted_points[key]
-        share = adj / total_adjusted if total_adjusted > 0 else 0
-        pay = round(share * BANK_RYO, 2)
+
+        did = _identity_discord_id(key)
+        opted_out = bool(did and did in opted_out_ids)
+        if opted_out:
+            pay = "Opted Out"
+        else:
+            share = adj / eligible_adjusted if eligible_adjusted > 0 else 0
+            pay = round(share * BANK_RYO, 2)
 
         output.append([
             i, medic, raw, jobs, rank_title, mult, round(adj, 2), pay,
@@ -697,7 +868,12 @@ def update_single_leaderboard(year: int, month: int):
         rank = rank_by_identity.get(key, "Unranked")
         adjusted[key] = raw_pts * bonus_from_rank(rank)
 
-    total_adj = sum(adjusted.values())
+    opted_out_ids = get_payout_optouts(year, month)
+    eligible_adj = sum(
+        adj for key, adj in adjusted.items()
+        if _identity_discord_id(key) not in opted_out_ids
+    )
+
     output = [LEADERBOARD_HEADERS]
     sorted_keys = sorted(adjusted, key=adjusted.get, reverse=True)
 
@@ -708,8 +884,14 @@ def update_single_leaderboard(year: int, month: int):
         rank_title = rank_by_identity.get(key, "Unranked")
         mult = bonus_from_rank(rank_title)
         adj_pts = adjusted[key]
-        share = adj_pts / total_adj if total_adj else 0
-        pay = round(share * BANK_RYO, 2)
+
+        did = _identity_discord_id(key)
+        opted_out = bool(did and did in opted_out_ids)
+        if opted_out:
+            pay = "Opted Out"
+        else:
+            share = adj_pts / eligible_adj if eligible_adj else 0
+            pay = round(share * BANK_RYO, 2)
 
         output.append([
             i, medic, raw_pts, jobs, rank_title, mult, round(adj_pts, 2), pay,
@@ -1781,7 +1963,8 @@ tree = discord.app_commands.CommandTree(bot)
 
 
 # ================= COMMANDS =================
-# Command interface consolidated in MedBot v3.7. Previous-month website stats added in v3.8.
+# Command interface consolidated in MedBot v3.7.
+# Monthly payout opt-out/redistribution added in MedBot v3.9. Previous-month website stats added in v3.8.
 @tree.command(
     name="setrank",
     description="Ranks are controlled by Discord roles"
@@ -1933,9 +2116,7 @@ async def set_ryo(interaction: discord.Interaction, year: int, month: int, amoun
         await interaction.followup.send("❌ Ryo must be positive.")
         return
 
-    key = get_month_key(year, month)
-    monthly_ryo[key] = amount
-    save_monthly_ryo()
+    set_bank_ryo(year, month, amount)
 
     month_name = datetime(year, month, 1).strftime("%B")
     await interaction.followup.send(
@@ -2065,9 +2246,19 @@ async def leaderboard_cmd(interaction: discord.Interaction):
             return
 
         lines = []
+        payout_snapshot = calculate_monthly_payout_snapshot(
+            datetime.now().year, datetime.now().month
+        )
+        opted_out_names = {
+            row["medic"] for row in payout_snapshot["rows"] if row["opted_out"]
+        }
+
         for i, (medic, points) in enumerate(sorted_data[:10], start=1):
             job_count = jobs_by_medic.get(medic, 0)
-            lines.append(f"**{i}. {medic}** — {points} pts ({job_count} jobs)")
+            payout_note = " — 🚫 pay opted out" if medic in opted_out_names else ""
+            lines.append(
+                f"**{i}. {medic}** — {points} pts ({job_count} jobs){payout_note}"
+            )
 
         embed = discord.Embed(
             title=f"🏆 Medic Leaderboard — {datetime.now().strftime('%B %Y')}",
@@ -2475,6 +2666,12 @@ medadmin_group = discord.app_commands.Group(
     description="Medical Corps administration and synchronization",
 )
 
+payout_group = discord.app_commands.Group(
+    name="payout",
+    description="Manage monthly Medic payout eligibility",
+)
+medadmin_group.add_command(payout_group)
+
 
 @reports_group.command(name="recent", description="View your recent editable Medic reports")
 async def reports_recent(interaction: discord.Interaction):
@@ -2683,6 +2880,196 @@ async def medadmin_sync(
 
     except Exception as e:
         await interaction.followup.send(f"⚠️ Sync error: {e}")
+
+
+
+@payout_group.command(name="optout", description="Exclude a Medic from pay for one month")
+@discord.app_commands.describe(
+    medic="Medic who declined payment",
+    year="Year, e.g. 2026",
+    month="Month number, 1-12",
+)
+async def medadmin_payout_optout(
+    interaction: discord.Interaction,
+    medic: discord.Member,
+    year: int,
+    month: int,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("🚫 Admins only.")
+        return
+
+    if month < 1 or month > 12:
+        await interaction.followup.send("❌ Month must be 1–12.")
+        return
+
+    linked = await asyncio.to_thread(linked_medic_for_discord_id, medic.id)
+    if not linked:
+        await interaction.followup.send(
+            f"⚠️ {medic.mention} is not linked to a Medic in the Master Medical Log. "
+            "Use `/medadmin link` first."
+        )
+        return
+
+    await asyncio.to_thread(
+        set_medic_payout_eligibility, year, month, medic.id, False
+    )
+    await asyncio.to_thread(get_raw_records_cached, True)
+    await asyncio.to_thread(update_single_leaderboard, year, month)
+
+    snapshot = await asyncio.to_thread(calculate_monthly_payout_snapshot, year, month)
+    month_name = datetime(year, month, 1).strftime("%B")
+    medic_name = str(linked.get("Medic", "") or member_display_name(medic))
+
+    await interaction.followup.send(
+        f"✅ **{medic_name}** opted out of the **{month_name} {year}** payout.\n"
+        "Their reports, BP, jobs, leaderboard position, and rank progress are unchanged.\n"
+        f"💰 **{snapshot['pool']:,} Ryo** is now redistributed across "
+        f"**{snapshot['eligible_count']} eligible Medic(s)**."
+    )
+
+
+@payout_group.command(name="optin", description="Restore a Medic's pay eligibility for one month")
+@discord.app_commands.describe(
+    medic="Medic to restore to the payout",
+    year="Year, e.g. 2026",
+    month="Month number, 1-12",
+)
+async def medadmin_payout_optin(
+    interaction: discord.Interaction,
+    medic: discord.Member,
+    year: int,
+    month: int,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("🚫 Admins only.")
+        return
+
+    if month < 1 or month > 12:
+        await interaction.followup.send("❌ Month must be 1–12.")
+        return
+
+    linked = await asyncio.to_thread(linked_medic_for_discord_id, medic.id)
+    if not linked:
+        await interaction.followup.send(
+            f"⚠️ {medic.mention} is not linked to a Medic in the Master Medical Log."
+        )
+        return
+
+    await asyncio.to_thread(
+        set_medic_payout_eligibility, year, month, medic.id, True
+    )
+    await asyncio.to_thread(get_raw_records_cached, True)
+    await asyncio.to_thread(update_single_leaderboard, year, month)
+
+    snapshot = await asyncio.to_thread(calculate_monthly_payout_snapshot, year, month)
+    month_name = datetime(year, month, 1).strftime("%B")
+    medic_name = str(linked.get("Medic", "") or member_display_name(medic))
+
+    await interaction.followup.send(
+        f"✅ **{medic_name}** is eligible again for the **{month_name} {year}** payout.\n"
+        f"💰 The **{snapshot['pool']:,} Ryo** pool has been recalculated across "
+        f"**{snapshot['eligible_count']} eligible Medic(s)**."
+    )
+
+
+@payout_group.command(name="status", description="Show payout eligibility and distribution for one month")
+@discord.app_commands.describe(
+    year="Year, e.g. 2026",
+    month="Month number, 1-12",
+)
+async def medadmin_payout_status(
+    interaction: discord.Interaction,
+    year: int,
+    month: int,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("🚫 Admins only.")
+        return
+
+    if month < 1 or month > 12:
+        await interaction.followup.send("❌ Month must be 1–12.")
+        return
+
+    snapshot = await asyncio.to_thread(calculate_monthly_payout_snapshot, year, month)
+    month_name = datetime(year, month, 1).strftime("%B")
+
+    if not snapshot["rows"]:
+        await interaction.followup.send(
+            f"📋 No Medic reports found for **{month_name} {year}**."
+        )
+        return
+
+    opted_rows = [row for row in snapshot["rows"] if row["opted_out"]]
+    lines = [
+        f"💰 **Payout Status — {month_name} {year}**",
+        f"**Pool:** {snapshot['pool']:,} Ryo",
+        f"**Eligible:** {snapshot['eligible_count']}",
+        f"**Opted out:** {snapshot['opted_out_count']}",
+    ]
+
+    if opted_rows:
+        lines.append("")
+        lines.append("**Opted out:**")
+        for row in opted_rows[:20]:
+            lines.append(
+                f"• {row['medic']} — {row['adjusted_points']:.2f} adjusted BP — **0 Ryo**"
+            )
+        if len(opted_rows) > 20:
+            lines.append(f"• +{len(opted_rows) - 20} more")
+
+    lines.append("")
+    lines.append("**Eligible payout preview:**")
+    eligible_rows = [row for row in snapshot["rows"] if not row["opted_out"]]
+    for row in eligible_rows[:15]:
+        lines.append(
+            f"• {row['medic']} — **{row['pay']:,.2f} Ryo** "
+            f"({row['adjusted_points']:.2f} adjusted BP)"
+        )
+    if len(eligible_rows) > 15:
+        lines.append(f"• +{len(eligible_rows) - 15} more")
+
+    await interaction.followup.send("\n".join(lines))
+
+
+@payout_group.command(name="recalculate", description="Recalculate one month's payout without changing activity")
+@discord.app_commands.describe(
+    year="Year, e.g. 2026",
+    month="Month number, 1-12",
+)
+async def medadmin_payout_recalculate(
+    interaction: discord.Interaction,
+    year: int,
+    month: int,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("🚫 Admins only.")
+        return
+
+    if month < 1 or month > 12:
+        await interaction.followup.send("❌ Month must be 1–12.")
+        return
+
+    await asyncio.to_thread(get_raw_records_cached, True)
+    await asyncio.to_thread(update_single_leaderboard, year, month)
+    snapshot = await asyncio.to_thread(calculate_monthly_payout_snapshot, year, month)
+
+    month_name = datetime(year, month, 1).strftime("%B")
+    await interaction.followup.send(
+        f"🔄 **{month_name} {year} payout recalculated**\n"
+        f"• Pool: **{snapshot['pool']:,} Ryo**\n"
+        f"• Eligible Medics: **{snapshot['eligible_count']}**\n"
+        f"• Opted out: **{snapshot['opted_out_count']}**\n"
+        "• Reports/BP/rank progress: **unchanged**"
+    )
 
 
 @medadmin_group.command(name="leaderboard", description="Rebuild one month's leaderboard sheet")
